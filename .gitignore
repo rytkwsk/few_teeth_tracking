@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Runtime output
+logs/
+
+# Per-setup state (initial poses, marker registration and their backups)
+initial_poses/
+initial_pose.npy
+
+# pym3t sparse-viewpoint caches (regenerated on first run, hundreds of MB each)
+models/*.meta
+models/*.bak
+
+# Calibration images (kept in ../pym3t)
+calibration_images*/
