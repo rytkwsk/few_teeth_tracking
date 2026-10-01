@@ -149,6 +149,46 @@ SINGLE_BODY_MODE = True
 ARCH_MODEL_NAME  = "arch_4groups_smooth.obj"
 ARCH_SHARP_EDGE_DEG = 35.0
 ARCH_QUALITY_MAX_EDGES = 1000      # 品質判定用ワイヤーフレームの本数（1500 で fps 13。速度優先で少し減らす）
+
+# ── 階層アンカー（Anchor Switching デモ用、2026-09-29）────────────────────────
+# 歯列全体（キー "F"）を主アンカーとして追跡しつつ、4 歯群（A〜D）も副アンカーとして同時に M3T で
+# 追跡する。通常は F の姿勢を出力し、F の適合度が落ちた（＝手や器具で歯列の大部分が隠れた）ときだけ、
+# まだ良く見えている歯群の姿勢に切り替える。全アンカーは毎フレーム出力姿勢に同期されるので、
+# 副アンカーは「遮蔽の間だけ、直前の良好姿勢から短時間引き継ぐ」役割になる（2026-09-09 に見た
+# 「小さいアンカー単独では奥行きが決まらず発散する」問題を避ける）。
+HIERARCHICAL_ANCHORS      = True
+ANCHOR_F_OK_QUALITY       = 0.45   # F の単体適合度がこれ以上なら F を出力（切替しない）
+ANCHOR_F_RECOVER_QUALITY  = 0.55   # 歯群へ切替後、F がこれ以上に戻ったら F へ復帰（0.45 で復帰すると往復した）
+ANCHOR_GROUP_MIN_QUALITY = 0.60   # 0.55→0.60 (2026-10-01)。副アンカーへ切り替える最低適合度
+ANCHOR_SWITCH_MAX_ROT_DEG = 15.0   # 20→15 (2026-10-01: 歯群 D が切替後 0.5 s で 63 mm ずれた)
+ANCHOR_SWITCH_MAX_TRANS_M = 0.015   # 20 mm → 15 mm (2026-10-01)
+ANCHOR_MIN_DWELL_SEC      = 1.5    # 切替後、最低これだけは同じアンカーに留まる（0.5 s では 5 分で 53 回切り替わった）
+# 姿勢源にしてよい歯群。C（犬歯+側切歯の 2 本）は丸い形状で回転が決まらず、q 0.65 でも 44° 外れて
+# 毎回ロストの引き金になった（2026-09-29 17:50 録画: ロスト 3 回すべて C 起因）。強調表示には残す。
+ANCHOR_POSE_SOURCE_KEYS   = ("A", "B", "D")
+# 歯群で姿勢を出している間の逸脱監視: 切替時点の姿勢からこれ以上離れたら F（保持姿勢）へ戻す。
+# 歯群ボディは全体に比べて拘束が弱く、遮蔽中にじわじわ回って最後に吹っ飛ぶ。
+ANCHOR_GROUP_MAX_DRIFT_DEG = 15.0   # 30→15 (2026-10-01)
+ANCHOR_GROUP_MAX_DRIFT_M = 0.020   # 40→20 mm (2026-10-01)
+# 逸脱で F に戻した直後に同じ歯群へ再切替すると、基準が更新されて 12 mm ずつ流れ続ける（12:44 のログで
+# F→A→F→A… を繰り返して 400 mm まで流れた）。戻した後はこの秒数だけ歯群への切替を禁止する。
+ANCHOR_DRIFT_COOLDOWN_SEC = 1.5
+# 出力姿勢の 1 フレーム跳び量ゲート（全モード共通）。前フレームの出力からこれ以上跳んだ姿勢は捨て、
+# 前フレーム姿勢に全ボディを戻して M3T にやり直させる。12 fps で 30 mm/フレーム = 0.36 m/s。
+# 2026-10-01 ログ: 1 フレームで 38〜94 mm、奥行き 62 mm まで突っ込む「吹っ飛び」が 66 回。
+POSE_JUMP_MAX_TRANS_M     = 0.030
+POSE_JUMP_MAX_ROT_DEG     = 30.0
+POSE_DEPTH_MIN_M          = 0.09   # デモ配置は 150 mm 前後。カメラ距離を変えたらここも変える
+POSE_DEPTH_MAX_M          = 0.28
+# ゲートの固着防止: 跳び先の剛体整合スコアが GOOD 以上で、かつ保持姿勢よりこのマージン以上良ければ
+# 跳びを受け入れる。2026-10-01 12:24 のログで、歯群 D の誤姿勢（63 mm ずれ）を出力した直後に F が毎フレーム
+# 正しい位置（49 mm 先）へ収束するのをゲートが 50 回以上拒否し続け、再ロックまで 3 秒固まった。
+POSE_JUMP_ACCEPT_MARGIN   = 0.10
+POSE_JUMP_ACCEPT_FRAMES   = 3       # 同じ跳び先（5 mm/5° 以内）が連続この回数そろったら受け入れる
+# 12:35 のログ: 跳び先 q 0.68 vs 保持 0.37 で受け入れた先が 29 mm ずれ（奥行き 25 mm 手前）だった。
+# エッジだけの剛体整合は手前に寄った大きめの投影でも高く出るため、歯色（内部点・外側帯）を掛けた
+# スコアで比較し、かつ 3 フレーム連続で同じ跳び先に収束したときだけ受け入れる。
+ARCH_ANCHOR_KEY = "F" if SINGLE_BODY_MODE else "A"
 arch_model_path = os.path.join(SCRIPT_DIR, "models", ARCH_MODEL_NAME)
 
 # M3T の texture modality（実画像の特徴点で相対運動を拘束。モデルにテクスチャは不要）。
@@ -222,6 +262,55 @@ QUALITY_SELECT_WEIGHT = 300.0  # 候補順位を支配する: (1 - edge_match) *
 COARSE_YAW_STEPS_DEG = (-20.0, -10.0, 0.0, 10.0, 20.0)
 COARSE_PITCH_STEPS_DEG = (-10.0, 0.0, 10.0)
 COARSE_TOP_K = 5
+
+# Unity の Quick Align（auto_align）用の並進探索。従来の候補生成は保存スロットの
+# 「回転だけ」を振るため、模型をスロット保存時と違う場所に置くと全く合わなかった
+# （M3T の収束範囲は 1〜2 cm / 10〜15° 程度）。ここでは各基準姿勢（保存スロット・
+# 現在姿勢・最後の良好姿勢）を中心に、画面平行方向・奥行き・yaw/pitch の格子で候補を
+# 作り、粗採点（投影エッジの一致率、1 候補 0.4 ms）→ 上位セルの局所細分 → M3T 精密化
+# の 3 段で絞る。粗採点は 1 基準姿勢あたり約 3600 候補 ≒ 1.5 s。
+ALIGN_TRANS_SEARCH_ENABLED = True
+ALIGN_XY_RANGE_M       = 0.040                       # 画面平行方向 ±40 mm
+ALIGN_XY_STEP_M        = 0.010                       # 10 mm 刻み → 9×9
+ALIGN_DEPTH_FACTORS    = (0.80, 0.90, 1.00, 1.12, 1.25)  # 奥行き倍率（同じ視線上で前後）
+ALIGN_YAW_STEPS_DEG    = (-20.0, 0.0, 20.0)
+ALIGN_PITCH_STEPS_DEG  = (-15.0, 0.0, 15.0)
+ALIGN_LOCAL_CELLS      = 12                          # 局所細分に回す上位セル数
+ALIGN_LOCAL_XY_M       = (-0.005, 0.0, 0.005)        # 細分: ±5 mm
+ALIGN_LOCAL_DEPTH      = (0.95, 1.0, 1.05)
+ALIGN_LOCAL_YAW_DEG    = (-10.0, 0.0, 10.0)
+ALIGN_LOCAL_PITCH_DEG  = (-8.0, 0.0, 8.0)
+ALIGN_NMS_TRANS_M      = 0.012                       # 近すぎるセルは同一候補とみなす
+ALIGN_NMS_ROT_DEG      = 12.0
+ALIGN_TOP_K            = 8                           # M3T 精密化に回す候補数
+ALIGN_REFINE_STEPS     = 12
+ALIGN_MIN_QUALITY      = 0.45                        # これ未満なら「見つからず」と警告
+ALIGN_CENTER_MARGIN_PX = 60                          # 物体中心がこの縁幅より外の候補は捨てる
+ALIGN_COARSE_TOL_PX    = 12.0   # 粗格子（10 mm 刻み）の採点許容 [縮小画像 px]。640 幅・150 mm で 1 px ≒ 0.3 mm
+ALIGN_FINE_TOL_PX      = 6.0    # 局所細分（5 mm 刻み）の採点許容
+# エッジ一致だけでは歯列の周期性（歯が約 8 mm ごとに繰り返す）のせいで 13 mm / 23° ずれた姿勢が
+# 真値より高得点になる（オフライン検証 2026-09-29）。そこで「モデルの内部点が歯の色（低彩度・明）
+# の画素に乗っている割合」を掛け合わせる。上下方向・pitch のずれで歯肉のピンクに乗ると急落する。
+ALIGN_FILL_SAMPLES     = 3000   # モデル内部点として使う頂点数（全頂点からランダム抽出）
+ALIGN_WHITE_S_MAX      = 0.35   # HSV 彩度の上限（歯: 中央値 0.16, 75% 0.30 / 歯肉: 0.65 以上）
+ALIGN_WHITE_V_MIN      = 0.45   # HSV 明度の下限
+# 白い台座やぼかした ArUco 板の上に乗った候補は内部点が全部「歯色」になってしまうので、
+# 咬合面のすぐ外（模型座標で +y = 歯冠側。薄い軸が y で、-y が歯肉側）の帯も見て
+# 「そこは歯色でない（背景の机・上顎のピンク）」ことを要求する。歯肉側の帯は使えない:
+# この模型は歯の下が白い石膏で、赤いテープはさらに 1 cm 下にある（オフライン検証で below q=0.22）。
+ALIGN_BAND_AXIS        = (0.0, 1.0, 0.0)
+ALIGN_BAND_FRAC        = 0.30   # 内部点のうち歯冠側 30% を帯の元にする
+ALIGN_BAND_OFFSET_M    = 0.004  # 帯を歯冠側へずらす量
+# 歯列をほぼ真横（エッジオン）から見た候補は投影が細い帯に潰れ、歯の咬合縁に沿って置くだけで
+# エッジ・歯色・外側帯の全部を満たしてしまう（オフライン検証: 真値より高得点）。
+# 投影面積 × 奥行き² を基準姿勢（保存スロット）と比べ、大きく縮む候補は捨てる。
+ALIGN_MIN_AREA_RATIO   = 0.60
+ALIGN_MIN_SHORT_RATIO  = 0.50   # 投影 bbox の短辺 × 奥行き も基準の半分未満なら捨てる（細い帯の検出）
+# 歯列は歯が約 8 mm 周期で並ぶため、歯 1 本分横にずれた偽姿勢が採点上ほぼ同点になる。
+# デモでは模型を保存時とほぼ同じ場所に置く前提なので、基準姿勢（保存スロット等）からの距離に
+# 応じた弱いペナルティで「近い解」を優先する（10 mm で 0.025、40 mm で 0.10）。
+ALIGN_PRIOR_PER_M      = 2.5
+ALIGN_PRIOR_FINAL_PER_MM = 1.5  # M3T 精密化後の最終採点 score（(1-q)*300 ベース）への加算 [点/mm]
 VIEW_MODES = ("M3T", "WIREFRAME", "BLEND")
 FRAME_READ_RETRY_LIMIT = 120
 
@@ -262,11 +351,11 @@ LAST_GOOD_MAX_AGE_SEC   = HOLD_BEFORE_RECOVERY_SEC   # これより古い last_g
 # ジオメトリで評価し、上位 RIGID_QUALITY_TOP_K の平均を取る。3 = 単純平均。
 # 上位 2 平均だと、臼歯（A）が完全に外れていても B/C だけで 0.54 になり見逃した。
 # D（切歯）は取り外し式義歯パーツ＋ガーゼで見た目がモデルと一致しないため既定では除外する。
-RIGID_QUALITY_KEYS  = ("A",) if SINGLE_BODY_MODE else ("A", "B", "C")
+RIGID_QUALITY_KEYS  = ("F",) if SINGLE_BODY_MODE else ("A", "B", "C")
 RIGID_QUALITY_TOP_K = 3
 # 自動アンカー切替・スナップ時のアンカー選択の候補。D は Unity から手動指定した
 # ときだけ使う（D に切り替わった瞬間に pose が 100mm 以上飛ぶのをログで確認）。
-AUTO_ANCHOR_KEYS    = ("A",) if SINGLE_BODY_MODE else ("A", "B", "C")
+AUTO_ANCHOR_KEYS    = ("F",) if SINGLE_BODY_MODE else ("A", "B", "C")
 QUALITY_LOSS_CONSECUTIVE = 20    # 何フレーム連続で悪いと再ロックを試みるか（約 1 秒 @20fps）
 RECOVERY_COOLDOWN_SEC    = 0.8   # 自動再ロックの最短間隔（短くして素早く再試行）
 
@@ -700,10 +789,18 @@ def build_anchor(key, name, path, sphere_radius, sharp_deg, active_color, max_ed
 
     edge_a_idx = np.array([a for a, b in draw_edges], dtype=np.int32)
     edge_b_idx = np.array([b for a, b in draw_edges], dtype=np.int32)
+    fill_idx = np.random.default_rng(0).choice(len(vertices), size=min(ALIGN_FILL_SAMPLES, len(vertices)),
+                                               replace=False)
+    fill_vertices = vertices[fill_idx]
+    band_axis = np.array(ALIGN_BAND_AXIS, dtype=np.float32)
+    along = fill_vertices @ band_axis
+    band = along >= np.percentile(along, 100.0 * (1.0 - ALIGN_BAND_FRAC))
+    outside_vertices = fill_vertices[band] + band_axis * ALIGN_BAND_OFFSET_M
 
     return {
         "key": key, "name": name, "path": path, "model": m,
         "draw_vertices": draw_vertices, "draw_edges": draw_edges,
+        "fill_vertices": fill_vertices, "outside_vertices": outside_vertices,
         "edge_a_idx": edge_a_idx, "edge_b_idx": edge_b_idx,
         "viz_draw_vertices": viz_draw_vertices, "viz_draw_edges": viz_draw_edges,
         "active_color": active_color,
@@ -711,12 +808,21 @@ def build_anchor(key, name, path, sphere_radius, sharp_deg, active_color, max_ed
 
 
 if SINGLE_BODY_MODE:
-    # 歯列全体を 1 ボディで追跡。キーは "A" のみ（HUD/CSV の B〜D は空欄になる）
+    # 歯列全体を 1 ボディ（キー "F"）で追跡。階層アンカー有効時は 4 歯群（A〜D）も副アンカーとして追加。
     ANCHORS = [
-        build_anchor("A", ARCH_MODEL_NAME, arch_model_path, ANCHOR_A_SPHERE_RADIUS, ARCH_SHARP_EDGE_DEG,
-                     ANCHOR_A_COLOR, max_edges=ARCH_QUALITY_MAX_EDGES),
+        build_anchor("F", ARCH_MODEL_NAME, arch_model_path, ANCHOR_A_SPHERE_RADIUS, ARCH_SHARP_EDGE_DEG,
+                     (255, 255, 255), max_edges=ARCH_QUALITY_MAX_EDGES),
     ]
-    print("単体ボディモード: 4 グループ結合モデルを 1 つの M3T ボディとして追跡します")
+    if HIERARCHICAL_ANCHORS:
+        ANCHORS += [
+            build_anchor("A", ANCHOR_A_NAME, anchor_a_path, ANCHOR_A_SPHERE_RADIUS, ANCHOR_A_SHARP_EDGE_DEG, ANCHOR_A_COLOR),
+            build_anchor("B", ANCHOR_B_NAME, anchor_b_path, ANCHOR_B_SPHERE_RADIUS, ANCHOR_B_SHARP_EDGE_DEG, ANCHOR_B_COLOR),
+            build_anchor("C", ANCHOR_C_NAME, anchor_c_path, ANCHOR_C_SPHERE_RADIUS, ANCHOR_C_SHARP_EDGE_DEG, ANCHOR_C_COLOR),
+            build_anchor("D", ANCHOR_D_NAME, anchor_d_path, ANCHOR_D_SPHERE_RADIUS, ANCHOR_D_SHARP_EDGE_DEG, ANCHOR_D_COLOR),
+        ]
+        print("階層アンカーモード: 歯列全体 F を主アンカー、4 歯群 A〜D を副アンカーとして追跡します")
+    else:
+        print("単体ボディモード: 4 グループ結合モデルを 1 つの M3T ボディとして追跡します")
 else:
     ANCHORS = [
         build_anchor("A", ANCHOR_A_NAME, anchor_a_path, ANCHOR_A_SPHERE_RADIUS, ANCHOR_A_SHARP_EDGE_DEG, ANCHOR_A_COLOR),
@@ -1173,7 +1279,7 @@ def project_vertices(verts, candidate_pose):
 
 
 def estimate_tracking_quality_for(dist_map, candidate_pose, draw_verts, edge_a_idx, edge_b_idx,
-                                   max_dist=QUALITY_EDGE_MAX_DIST_PX):
+                                   max_dist=QUALITY_EDGE_MAX_DIST_PX, count_out_of_bounds=False, soft=False):
     """投影したワイヤーフレームのうち、実画像のエッジ付近に乗っている割合。
     pym3t は残差/信頼度を返さないため、これが唯一のフィット判定手段になる。
     エッジごとサンプル数を固定してベクトル化し、候補が多くても軽い。
@@ -1208,13 +1314,69 @@ def estimate_tracking_quality_for(dist_map, candidate_pose, draw_verts, edge_a_i
         dist = dist_map[0, yi_c, xi_c]
     hits = in_bounds & (dist <= max_dist)
 
-    total = int(np.count_nonzero(in_bounds))
-    return float(np.count_nonzero(hits)) / total if total > 0 else 0.0
+    # count_out_of_bounds=True（並進探索用）: 画面外に出たサンプルも「外れ」として分母に入れる。
+    # 既定の「画面内サンプルだけで割る」だと、物体の大半が画面外に出た候補が残り少数の
+    # サンプルの偶然の一致で 1.0 になり、探索でそれが最上位に来てしまう。
+    total = int(np.count_nonzero(np.broadcast_to(edge_valid[:, None], in_bounds.shape)))         if count_out_of_bounds else int(np.count_nonzero(in_bounds))
+    if total <= 0:
+        return 0.0
+    if soft:
+        # 距離に応じた連続スコア（max_dist で 0 に落ちる線形減衰）。粗い格子探索で
+        # 「近い候補ほど高い」という勾配を持たせるため。ヒット/ミスの 2 値だと格子
+        # 間隔（10 mm）に対して許容 4 px（約 1 mm）が狭すぎて真値近傍の候補が拾えない。
+        soft_hit = np.where(in_bounds, np.clip(1.0 - dist / max_dist, 0.0, 1.0), 0.0)
+        return float(soft_hit.sum()) / total
+    return float(np.count_nonzero(hits)) / total
 
 
-def estimate_anchor_quality(dist_map, candidate_pose, anchor):
+def estimate_anchor_quality(dist_map, candidate_pose, anchor, count_out_of_bounds=False):
     return estimate_tracking_quality_for(
-        dist_map, candidate_pose, anchor["draw_vertices"], anchor["edge_a_idx"], anchor["edge_b_idx"])
+        dist_map, candidate_pose, anchor["draw_vertices"], anchor["edge_a_idx"], anchor["edge_b_idx"],
+        count_out_of_bounds=count_out_of_bounds)
+
+
+def compute_tooth_mask(bgr):
+    """歯らしい色（低彩度・明るい）の画素マスク。並進探索の内部点採点用。"""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    return (hsv[..., 1] < ALIGN_WHITE_S_MAX * 255) & (hsv[..., 2] > ALIGN_WHITE_V_MIN * 255)
+
+
+def _mask_hit_fraction(mask, verts, candidate_pose, want=True):
+    """verts を投影し、mask が want と一致する画素に乗っている割合（画面外は不一致扱い）。"""
+    pts2d, valid = project_vertices(verts, candidate_pose)
+    xi = np.round(pts2d[:, 0]).astype(np.int32)
+    yi = np.round(pts2d[:, 1]).astype(np.int32)
+    inb = valid & (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+    if not inb.any():
+        return 0.0
+    hit = mask[yi[inb], xi[inb]]
+    return float(np.count_nonzero(hit if want else ~hit)) / len(xi)
+
+
+def estimate_fill_quality(tooth_mask, candidate_pose):
+    """F モデルの内部点が歯色マスクに乗っている割合。"""
+    return _mask_hit_fraction(tooth_mask, ANCHORS[0]["fill_vertices"], candidate_pose, want=True)
+
+
+def estimate_outside_quality(tooth_mask, candidate_pose):
+    """咬合面のすぐ外の帯が歯色「でない」割合（白い台座・板の上の偽候補を落とす）。"""
+    return _mask_hit_fraction(tooth_mask, ANCHORS[0]["outside_vertices"], candidate_pose, want=False)
+
+
+def estimate_color_quality(tooth_mask, candidate_pose):
+    return float(np.sqrt(estimate_fill_quality(tooth_mask, candidate_pose)
+                         * estimate_outside_quality(tooth_mask, candidate_pose)))
+
+
+def estimate_search_quality(dist_map, candidate_pose, max_dist, tooth_mask):
+    """並進探索の採点: エッジ一致（画面外も外れ、距離に応じた連続スコア、max_dist は縮小画像 px）と
+    内部点の歯色一致の幾何平均。片方だけ高い偽候補（白い台座・ぼかした ArUco 板・周期ずれ）を
+    落とすために和ではなく積にしている。"""
+    a = ANCHORS[0]
+    edge_q = estimate_tracking_quality_for(
+        dist_map, candidate_pose, a["draw_vertices"], a["edge_a_idx"], a["edge_b_idx"],
+        max_dist=max_dist, count_out_of_bounds=True, soft=True)
+    return float(np.sqrt(edge_q * estimate_color_quality(tooth_mask, candidate_pose)))
 
 
 def estimate_rigid_quality(dist_map, candidate_pose, keys=None):
@@ -1288,10 +1450,237 @@ def generate_candidate_poses():
     return candidates
 
 
-def pose_auto_select(frame_bgr, dist_map, use_rotation_guard=True, reference_pose=None):
+_ALIGN_OBJ_CENTER = None
+
+
+def _align_object_center():
+    """回転の中心に使うモデル座標系の重心（F アンカーの品質判定用頂点の平均）。"""
+    global _ALIGN_OBJ_CENTER
+    if _ALIGN_OBJ_CENTER is None:
+        _ALIGN_OBJ_CENTER = np.mean(ANCHORS[0]["draw_vertices"], axis=0).astype(np.float32)
+    return _ALIGN_OBJ_CENTER
+
+
+def _perturb_pose(base_pose, dx, dy, depth_factor, yaw, pitch):
+    """base_pose を「物体重心まわりに yaw/pitch 回転 → 同じ視線上で奥行きを depth_factor 倍
+    → カメラ x/y に dx,dy [m] 平行移動」した候補を返す。
+    回転をモデル原点ではなく重心まわりに掛けるのは、原点が物体から離れていると回転だけで
+    画面上の位置が大きく飛び、格子の意味が無くなるため。"""
+    R = base_pose[:3, :3]
+    t = base_pose[:3, 3]
+    c_model = _align_object_center()
+    c_cam = R @ c_model + t
+    if yaw != 0.0 or pitch != 0.0:
+        R = (rot_y(yaw) @ rot_x(pitch)) @ R
+    c_cam = c_cam * depth_factor
+    c_cam = c_cam + np.array([dx, dy, 0.0], dtype=np.float32)
+    out = np.eye(4, dtype=np.float32)
+    out[:3, :3] = R
+    out[:3, 3] = c_cam - R @ c_model
+    return out
+
+
+def _align_base_poses():
+    """並進探索の基準姿勢: 保存スロット + 現在姿勢 + 最後の良好姿勢（重複は除く）。"""
+    bases = []
+    for slot in range(1, POSE_SLOT_COUNT + 1):
+        p, _ = load_pose_slot(slot)
+        if p is not None:
+            bases.append((slot, p.astype(np.float32)))
+    bases.append((None, pose.copy().astype(np.float32)))
+    if last_good_pose is not None:
+        bases.append((None, last_good_pose.copy().astype(np.float32)))
+    uniq = []
+    for slot, p in bases:
+        # 格子（±40 mm / ±20°）で十分カバーできる近い基準姿勢は 1 つにまとめる（基準が増えると探索時間が倍）
+        dup = any(rotation_angle_deg(p, q) < 10.0 and np.linalg.norm(p[:3, 3] - q[:3, 3]) < 0.015
+                  for _, q in uniq)
+        if not dup:
+            uniq.append((slot, p))
+    return uniq
+
+
+_align_base_centers = []
+
+
+def _align_prior_distance(candidate_pose):
+    """候補の物体中心と、最も近い基準姿勢の物体中心との距離 [m]。"""
+    if not _align_base_centers:
+        return 0.0
+    c = candidate_pose[:3, :3] @ _align_object_center() + candidate_pose[:3, 3]
+    return float(min(np.linalg.norm(c - b) for b in _align_base_centers))
+
+
+def _score_grid(dist_map, tooth_mask, slot, base_pose, xy_offsets, depth_factors, yaws, pitches, max_dist,
+                ref_area_norm=None):
+    """格子の全候補を粗採点して [(q, slot, pose), ...] を返す（q は基準姿勢からの距離ペナルティ込み）。
+    (奥行き, yaw, pitch) ごとに投影は 1 回だけ行い、画面平行の xy オフセットはカメラ座標の平行移動
+    なので各点の画素シフト = fx·dx/Z で一括計算する（1 候補ずつ投影すると 1.5 ms × 5000 = 7.6 s
+    かかっていた。2026-10-01 実機ログ）。"""
+    a = ANCHORS[0]
+    offs = np.asarray(xy_offsets, dtype=np.float32).reshape(-1, 2)
+    n_off = len(offs)
+    fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+    hm, wm = dist_map.shape[1:3]
+    sc = QUALITY_SCALE
+    c_model = _align_object_center()
+    margin = ALIGN_CENTER_MARGIN_PX
+    min_area = ref_area_norm[0] * ALIGN_MIN_AREA_RATIO if ref_area_norm else 0.0
+    min_short = ref_area_norm[1] * ALIGN_MIN_SHORT_RATIO if ref_area_norm else 0.0
+    ea, eb = a["edge_a_idx"], a["edge_b_idx"]
+    T = EDGE_SAMPLE_T
+    dx_px = (fx * offs[:, 0]).astype(np.float32)   # 画素シフト = dx_px / Z
+    dy_px = (fy * offs[:, 1]).astype(np.float32)
+
+    def _mask_frac(verts, R, t, want):
+        pc = (R @ verts.T).T + t
+        vz = pc[:, 2] > 0.05
+        invz = 1.0 / np.maximum(pc[:, 2], 1e-6)
+        vx = fx * pc[:, 0] * invz + cx
+        vy = fy * pc[:, 1] * invz + cy
+        xi = np.round(vx[None, :] + dx_px[:, None] * invz[None, :]).astype(np.int32)   # (n_off, M)
+        yi = np.round(vy[None, :] + dy_px[:, None] * invz[None, :]).astype(np.int32)
+        inb = vz[None, :] & (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+        hit = np.zeros(xi.shape, dtype=bool)
+        hit[inb] = tooth_mask[yi[inb], xi[inb]]
+        if not want:
+            hit = inb & ~hit
+        return hit.sum(axis=1) / float(verts.shape[0])
+
+    results = []
+    for depth_factor in depth_factors:
+        for yaw in yaws:
+            for pitch in pitches:
+                p0 = _perturb_pose(base_pose, 0.0, 0.0, depth_factor, yaw, pitch)
+                R, t = p0[:3, :3], p0[:3, 3]
+                if not (0.03 < float(t[2]) < 2.0):
+                    continue
+                if min_area > 0.0:
+                    area_n, short_n = _projected_extent_norm(p0)   # xy シフトでは変わらない
+                    if area_n < min_area or short_n < min_short:
+                        continue
+                # 物体中心の画面位置（オフセットごと）
+                c_cam = R @ c_model + t
+                if c_cam[2] <= 0.05:
+                    continue
+                ccx = fx * (c_cam[0] + offs[:, 0]) / c_cam[2] + cx
+                ccy = fy * (c_cam[1] + offs[:, 1]) / c_cam[2] + cy
+                ok = (ccx >= margin) & (ccx <= w - margin) & (ccy >= margin) & (ccy <= h - margin)
+                if not ok.any():
+                    continue
+                # エッジ一致（ソフトスコア）
+                pc = (R @ a["draw_vertices"].T).T + t
+                valid = pc[:, 2] > 0.05
+                invz = 1.0 / np.maximum(pc[:, 2], 1e-6)
+                x = fx * pc[:, 0] * invz + cx
+                y = fy * pc[:, 1] * invz + cy
+                sx = x[ea][:, None] * (1.0 - T) + x[eb][:, None] * T          # (E, nT)
+                sy = y[ea][:, None] * (1.0 - T) + y[eb][:, None] * T
+                sinv = invz[ea][:, None] * (1.0 - T) + invz[eb][:, None] * T
+                ev = valid[ea] & valid[eb]
+                d = np.stack([x[eb] - x[ea], y[eb] - y[ea]], axis=1)
+                normal_ang = np.mod(np.arctan2(d[:, 1], d[:, 0]) + np.pi / 2.0, np.pi)
+                nb = np.round(normal_ang / (np.pi / EDGE_ORIENT_BINS)).astype(np.int32) % EDGE_ORIENT_BINS
+                xi = np.round((sx[None] + dx_px[:, None, None] * sinv[None]) * sc).astype(np.int32)   # (n_off, E, nT)
+                yi = np.round((sy[None] + dy_px[:, None, None] * sinv[None]) * sc).astype(np.int32)
+                inb = ev[None, :, None] & (xi >= 0) & (xi < wm) & (yi >= 0) & (yi < hm)
+                xc = np.clip(xi, 0, wm - 1)
+                yc = np.clip(yi, 0, hm - 1)
+                dist = np.full(xi.shape, np.inf, dtype=np.float32)
+                for off in (-1, 0, 1):
+                    layer = (1 + ((nb + off) % EDGE_ORIENT_BINS))[None, :, None]
+                    dist = np.minimum(dist, dist_map[layer, yc, xc])
+                soft = np.where(inb, np.clip(1.0 - dist / max_dist, 0.0, 1.0), 0.0)
+                total = float(np.count_nonzero(ev) * len(T))
+                edge_q = soft.sum(axis=(1, 2)) / total if total > 0 else np.zeros(n_off)
+                fill_q = _mask_frac(a["fill_vertices"], R, t, True)
+                out_q = _mask_frac(a["outside_vertices"], R, t, False)
+                q = np.sqrt(edge_q * np.sqrt(fill_q * out_q))
+                # 基準姿勢からの距離ペナルティ
+                centers = c_cam[None, :] + np.concatenate([offs, np.zeros((n_off, 1), np.float32)], axis=1)
+                if _align_base_centers:
+                    prior = np.min([np.linalg.norm(centers - b[None, :], axis=1) for b in _align_base_centers], axis=0)
+                else:
+                    prior = np.zeros(n_off, np.float32)
+                q = q - ALIGN_PRIOR_PER_M * prior
+                for k in np.nonzero(ok)[0]:
+                    cand = p0.copy()
+                    cand[0, 3] += offs[k, 0]
+                    cand[1, 3] += offs[k, 1]
+                    results.append((float(q[k]), slot, cand))
+    return results
+
+
+def _projected_extent_norm(candidate_pose):
+    """内部点の投影 bbox の (面積 × 奥行き², 短辺 × 奥行き)。奥行きによる見かけの縮小を打ち消し、
+    「向きによる潰れ」だけを見るための量。"""
+    pts2d, valid = project_vertices(ANCHORS[0]["fill_vertices"], candidate_pose)
+    if np.count_nonzero(valid) < 10:
+        return 0.0, 0.0
+    p = pts2d[valid]
+    span = p.max(axis=0) - p.min(axis=0)
+    z = float(candidate_pose[2, 3])
+    return float(span[0] * span[1]) * z * z, float(min(span[0], span[1])) * z
+
+
+def _projected_area_norm(candidate_pose):
+    return _projected_extent_norm(candidate_pose)[0]
+
+
+def _nms_poses(results, max_keep):
+    """粗採点結果を降順に見て、既に採用した候補と近い（並進 ALIGN_NMS_TRANS_M・回転
+    ALIGN_NMS_ROT_DEG 以内）ものは捨て、多様なセルを max_keep 個残す。"""
+    kept = []
+    for q, slot, cand in sorted(results, key=lambda r: r[0], reverse=True):
+        near = any(np.linalg.norm(cand[:3, 3] - k[2][:3, 3]) < ALIGN_NMS_TRANS_M
+                   and rotation_angle_deg(cand, k[2]) < ALIGN_NMS_ROT_DEG for k in kept)
+        if not near:
+            kept.append((q, slot, cand))
+            if len(kept) >= max_keep:
+                break
+    return kept
+
+
+def translation_search_candidates(dist_map, tooth_mask):
+    """Quick Align 用: 並進 + 回転の格子を粗採点 → 上位セルを局所細分 → 多様な上位
+    ALIGN_TOP_K 候補を [(coarse_q, slot, pose), ...] で返す。"""
+    t0 = time.perf_counter()
+    steps = np.arange(-ALIGN_XY_RANGE_M, ALIGN_XY_RANGE_M + 1e-6, ALIGN_XY_STEP_M, dtype=np.float32)
+    xy_offsets = [(float(dx), float(dy)) for dx in steps for dy in steps]
+    bases = _align_base_poses()
+    global _align_base_centers
+    _align_base_centers = [bp[:3, :3] @ _align_object_center() + bp[:3, 3] for _, bp in bases]
+    ext = np.array([_projected_extent_norm(bp) for _, bp in bases])
+    ref_area = (float(ext[:, 0].max()), float(ext[:, 1].max()))   # 最も正面向きの基準姿勢を基準にする
+    coarse = []
+    for slot, base_pose in bases:
+        coarse += _score_grid(dist_map, tooth_mask, slot, base_pose, xy_offsets, ALIGN_DEPTH_FACTORS,
+                              ALIGN_YAW_STEPS_DEG, ALIGN_PITCH_STEPS_DEG, ALIGN_COARSE_TOL_PX, ref_area)
+    t1 = time.perf_counter()
+    cells = _nms_poses(coarse, ALIGN_LOCAL_CELLS)
+    local_xy = [(dx, dy) for dx in ALIGN_LOCAL_XY_M for dy in ALIGN_LOCAL_XY_M]
+    fine = []
+    for q, slot, cell_pose in cells:
+        fine += _score_grid(dist_map, tooth_mask, slot, cell_pose, local_xy, ALIGN_LOCAL_DEPTH,
+                            ALIGN_LOCAL_YAW_DEG, ALIGN_LOCAL_PITCH_DEG, ALIGN_FINE_TOL_PX, ref_area)
+    t2 = time.perf_counter()
+    shortlist = _nms_poses(fine, ALIGN_TOP_K)
+    print(f"並進探索: 基準 {len(bases)} 姿勢 × 格子 = 粗 {len(coarse)} 候補 ({t1 - t0:.1f}s) → "
+          f"上位 {len(cells)} セルを細分 {len(fine)} 候補 ({t2 - t1:.1f}s) → 精密化 {len(shortlist)} 候補")
+    for q, slot, cand in shortlist:
+        c = projected_center(cand)
+        print(f"  粗候補 q={q:.2f} slot={slot} 画面({c[0]:.0f},{c[1]:.0f}) depth={cand[2, 3]:.3f}")
+    return shortlist
+
+
+def pose_auto_select(frame_bgr, dist_map, use_rotation_guard=True, reference_pose=None,
+                     translation_search=False):
     """2段階の自動姿勢選択。
     Stage1（安価）: 候補全部を生の投影でCannyエッジと粗く採点（tracker.step()なし）。
     Stage2（高価）: 上位 COARSE_TOP_K だけ実際にトラッカーで精密化して最終採点。
+    translation_search=True（Unity の Quick Align）: Stage1 を並進 + 回転の格子探索
+    （translation_search_candidates）に置き換え、模型がスロット保存時と別の場所にあっても
+    数 cm / 20〜30° の範囲で見つけられるようにする。数秒かかる。
     """
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     original_pose = pose.copy().astype(np.float32)
@@ -1300,40 +1689,53 @@ def pose_auto_select(frame_bgr, dist_map, use_rotation_guard=True, reference_pos
         if reference_pose is None:
             reference_pose = original_pose
 
-    # 保存スロット由来の候補に加えて「今の pose」と「最後の良好 pose」も候補に入れる。
-    # 誤検知でリカバリが走ったときに、遠いスロット近傍へ飛ばず現在位置へ戻れるようにする。
-    candidates = list(generate_candidate_poses())
-    candidates.append((None, original_pose.copy()))
-    if last_good_pose is not None:
-        candidates.append((None, last_good_pose.copy().astype(np.float32)))
+    refine_steps = AUTO_SELECT_STEPS
+    tooth_mask = None
+    if translation_search and ALIGN_TRANS_SEARCH_ENABLED:
+        tooth_mask = compute_tooth_mask(frame_bgr)
+        shortlist = [(q, rotation_angle_deg(cand, reference_pose), slot, cand)
+                     for q, slot, cand in translation_search_candidates(dist_map, tooth_mask)]
+        use_rotation_guard = False
+        refine_steps = ALIGN_REFINE_STEPS
+        if not shortlist:
+            reset_all_anchors(original_pose)
+            print("自動姿勢選択失敗: 並進探索で候補がありません")
+            return original_pose, None
+    else:
+        # 保存スロット由来の候補に加えて「今の pose」と「最後の良好 pose」も候補に入れる。
+        # 誤検知でリカバリが走ったときに、遠いスロット近傍へ飛ばず現在位置へ戻れるようにする。
+        candidates = list(generate_candidate_poses())
+        candidates.append((None, original_pose.copy()))
+        if last_good_pose is not None:
+            candidates.append((None, last_good_pose.copy().astype(np.float32)))
 
-    coarse_results = []
-    for slot, candidate_pose in candidates:
-        rotation_delta = rotation_angle_deg(candidate_pose, reference_pose)
-        if use_rotation_guard and rotation_delta > ROTATION_REJECT_DEG:
-            continue
-        depth = float(candidate_pose[2, 3])
-        if not (0.03 < depth < 2.0):
-            continue
-        if projected_center(candidate_pose) is None:
-            continue
-        coarse_quality = estimate_combined_quality(dist_map, candidate_pose)
-        coarse_results.append((coarse_quality, rotation_delta, slot, candidate_pose))
+        coarse_results = []
+        for slot, candidate_pose in candidates:
+            rotation_delta = rotation_angle_deg(candidate_pose, reference_pose)
+            if use_rotation_guard and rotation_delta > ROTATION_REJECT_DEG:
+                continue
+            depth = float(candidate_pose[2, 3])
+            if not (0.03 < depth < 2.0):
+                continue
+            if projected_center(candidate_pose) is None:
+                continue
+            coarse_quality = estimate_combined_quality(dist_map, candidate_pose)
+            coarse_results.append((coarse_quality, rotation_delta, slot, candidate_pose))
 
-    if not coarse_results:
-        reset_all_anchors(original_pose)
-        print("自動姿勢選択失敗: 粗選抜を通った候補がありません")
-        return original_pose, None
+        if not coarse_results:
+            reset_all_anchors(original_pose)
+            print("自動姿勢選択失敗: 粗選抜を通った候補がありません")
+            return original_pose, None
 
-    coarse_results.sort(key=lambda item: item[0], reverse=True)
-    shortlist = coarse_results[:COARSE_TOP_K]
-    print(f"自動姿勢選択: 候補 {len(coarse_results)} 個中、上位 {len(shortlist)} 個を精密化")
+        coarse_results.sort(key=lambda item: item[0], reverse=True)
+        shortlist = coarse_results[:COARSE_TOP_K]
+        print(f"自動姿勢選択: 候補 {len(coarse_results)} 個中、上位 {len(shortlist)} 個を精密化")
 
     best_slot, best_pose, best_score, best_quality, best_anchor_key = None, None, np.inf, 0.0, None
     for coarse_quality, rotation_delta, slot, candidate_pose in shortlist:
         before_center = projected_center(candidate_pose)
         reset_all_anchors(candidate_pose)
-        for _ in range(AUTO_SELECT_STEPS):
+        for _ in range(refine_steps):
             tracker.step(frame_rgb)
         # 両アンカーとも同じ候補姿勢から精密化するが、それぞれ独立に収束するので
         # 結果として品質が高い方のアンカーの姿勢を、この候補の代表結果として使う
@@ -1341,6 +1743,10 @@ def pose_auto_select(frame_bgr, dist_map, use_rotation_guard=True, reference_pos
         anchor_key, refined_pose, _ = best_anchor_pose_and_quality(dist_map)
         # 候補の採点は単体アンカーの値ではなく剛体整合スコアで行う
         quality = estimate_rigid_quality(dist_map, refined_pose)
+        if tooth_mask is not None:
+            # 並進探索: M3T 精密化後もエッジだけだと周期ずれの偽姿勢が真値より高得点になるため、
+            # 内部点の歯色一致を掛ける（粗採点と同じ考え方）。
+            quality = float(np.sqrt(quality * estimate_color_quality(tooth_mask, refined_pose)))
         after_center = projected_center(refined_pose)
         if after_center is None:
             continue
@@ -1351,7 +1757,9 @@ def pose_auto_select(frame_bgr, dist_map, use_rotation_guard=True, reference_pos
         depth_penalty = 0.0 if 0.03 < depth < 2.0 else 10000.0
         rotation_penalty = rotation_delta * ROTATION_PENALTY_WEIGHT if use_rotation_guard else 0.0
         quality_penalty = (1.0 - quality) * QUALITY_SELECT_WEIGHT
-        score = quality_penalty + move_px + center_penalty + depth_penalty + rotation_penalty
+        prior_penalty = (_align_prior_distance(refined_pose) * 1000.0 * ALIGN_PRIOR_FINAL_PER_MM
+                         if tooth_mask is not None else 0.0)
+        score = quality_penalty + move_px + center_penalty + depth_penalty + rotation_penalty + prior_penalty
         print(f"  候補(元スロット{slot}): score={score:.2f} coarse_q={coarse_quality:.2f} "
               f"refined_q={quality:.2f}(anchor {anchor_key}) move_px={move_px:.2f} "
               f"rot={rotation_delta:.1f}deg depth={depth:.3f}")
@@ -1367,6 +1775,10 @@ def pose_auto_select(frame_bgr, dist_map, use_rotation_guard=True, reference_pos
     reset_all_anchors(best_pose)
     print(f"自動選択完了（元スロット{best_slot}近傍、アンカー{best_anchor_key}）: "
           f"score={best_score:.2f} quality={best_quality:.2f}")
+    if translation_search and best_quality < ALIGN_MIN_QUALITY:
+        print(f"警告: 並進探索の最良候補でも quality={best_quality:.2f} < {ALIGN_MIN_QUALITY}。"
+              "模型が探索範囲（±4 cm / 奥行き ±25% / 30°）の外か、手や器具で隠れている可能性。"
+              "模型を画面中央寄りに置き直して Quick Align をやり直してください")
     return best_pose, best_slot
 
 
@@ -1386,7 +1798,8 @@ def start_tracking_from_current_pose(frame_bgr, light_snap_steps=5):
     pose_auto_select を呼ばないため、固定カメラ環境で背景エッジに引き込まれない。
     light_snap_steps: 数値計算の安定化のみを目的とした最小限の tracker.step()。
     """
-    global pose, snap_frames, tracking_active, active_anchor
+    global pose, snap_frames, tracking_active, active_anchor, prev_output_pose
+    prev_output_pose = None   # 跳び量ゲートの基準を無効化
     global lost_streak, last_recovery_time, last_good_pose, last_quality, recovery_escalated
     global quality_smoothed, last_good_time, relock_reason, lost_start_time
 
@@ -1459,8 +1872,12 @@ def draw_dual_wireframe(bgr, poses_by_key, active_key):
     一目で分かるようにする（論文の可視化方針を踏襲）。"""
     out = bgr.copy()
     # 非アクティブを先に描き、アクティブを後から上書きして見やすくする。
+    # 階層アンカーでは F（歯列全体）が A〜D を含むので、非アクティブの歯群は描かない
+    # （5 体 × 2500 本の cv2.line で 55 ms かかっていた）。F 非アクティブ時は F だけ薄く描く。
     for a in ANCHORS:
         if a["key"] == active_key:
+            continue
+        if HIERARCHICAL_ANCHORS and a["key"] != "F":
             continue
         _draw_wireframe_into(out, poses_by_key[a["key"]], a["viz_draw_vertices"], a["viz_draw_edges"],
                               INACTIVE_ANCHOR_COLOR, 1)
@@ -1488,13 +1905,22 @@ recovery_escalated = False
 good_streak = 0
 last_auto_capture_time = 0.0
 auto_capture_cursor = 0
-active_anchor = "A"  # 現在Unityへ出力しているアンカー（'A' or 'B'）
+active_anchor = ARCH_ANCHOR_KEY  # 現在 Unity へ出力している姿勢の出どころ（F / A〜D）
 manual_anchor_override = ""  # Unity トグルUIからの手動指定。空文字 = 自動切替
-unity_display_anchor = ""    # 単体ボディモードで Unity に強調させるグループ（表示のみ）。空文字 = 全グループ
+unity_display_anchor = ""    # （旧）単体ボディ表示専用の指定。階層アンカーでは display_anchor を使う
+display_anchor = ""          # Unity で強調表示する歯群（適合度が最も高い歯群、または切替先）。空文字 = 全体
+anchor_switch_time = 0.0     # 直近のアンカー切替時刻（最低滞在時間の判定用）
+anchor_switch_pose = None    # 歯群へ切り替えた時点の姿勢（逸脱監視の基準）
+group_block_until = 0.0      # 逸脱で F へ戻した後、この時刻まで歯群への再切替を禁止
+prev_output_pose = None      # 前フレームの出力姿勢（跳び量ゲートの基準）。再ロック直後は無効
+jump_target_pose = None      # ゲートが拒否した跳び先（連続性の判定用）
+jump_target_streak = 0
+pose_jump_rejects = 0        # ゲートで捨てた回数（ログ用）
 
 
 def start_tracking_from_frame(frame_bgr, use_rotation_guard=True):
-    global pose, selected_pose_slot, snap_frames, tracking_active, active_anchor
+    global pose, selected_pose_slot, snap_frames, tracking_active, active_anchor, prev_output_pose
+    prev_output_pose = None   # 跳び量ゲートの基準を無効化（再ロック先を「跳び」と誤判定しないため）
     global lost_streak, last_recovery_time, last_good_pose, last_quality, recovery_escalated
     global quality_smoothed, last_good_time, relock_reason, lost_start_time
 
@@ -1536,7 +1962,8 @@ def relock_from_frame(frame_bgr, reference_pose=None, use_rotation_guard=False, 
         GLOBAL 探索が 100mm 先の候補を選んで外れたため、スロットキーは「その姿勢へ戻す」
         という操作の意図どおりに動くようにした。
     """
-    global pose, selected_pose_slot, snap_frames, active_anchor
+    global pose, selected_pose_slot, snap_frames, active_anchor, prev_output_pose
+    prev_output_pose = None   # 跳び量ゲートの基準を無効化
     global lost_streak, last_recovery_time, last_good_pose, last_quality, recovery_escalated
     global quality_smoothed, last_good_time, relock_reason, lost_start_time
 
@@ -1570,18 +1997,26 @@ def relock_from_frame(frame_bgr, reference_pose=None, use_rotation_guard=False, 
 unity_udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if UNITY_UDP_ENABLED else None
 
 
+last_anchor_quality = {}   # 直近フレームの各アンカー単体適合度（Unity 送信・HUD 用）
+
+
 def send_pose_to_unity(pose_mat, mode_text):
     if unity_udp_sock is None:
         return
-    # 単体ボディモードでは Unity 側に「全グループを強調」させる。Unity のトグルで A〜D を
-    # 手動指定した場合はそのキーを送る（Unity 側の見た目だけの切替）。
+    # active_anchor（Unity が強調表示する歯群）: 階層アンカーでは display_anchor（適合度最良の歯群、
+    # または切替先）。pose_anchor は実際に姿勢を出しているアンカー（F = 歯列全体）。
     if SINGLE_BODY_MODE:
-        unity_anchor = unity_display_anchor if unity_display_anchor in ("A", "B", "C", "D") else "ALL"
+        if HIERARCHICAL_ANCHORS:
+            unity_anchor = display_anchor if display_anchor in ("A", "B", "C", "D") else "ALL"
+        else:
+            unity_anchor = unity_display_anchor if unity_display_anchor in ("A", "B", "C", "D") else "ALL"
     else:
         unity_anchor = active_anchor
     payload = json.dumps({
         "name": ANCHOR_BY_KEY[active_anchor]["name"],
         "active_anchor": unity_anchor,
+        "pose_anchor": active_anchor,
+        "quality": [round(float(last_anchor_quality.get(k, 0.0)), 3) for k in ("F", "A", "B", "C", "D")],
         "timestamp": time.time(),
         "mode": mode_text,
         "pose_cv": pose_mat.astype(float).reshape(16).tolist(),
@@ -1609,7 +2044,23 @@ def stop_tracking_from_unity():
     print("ADJUST モード / Unity から停止")
 
 
+def _rot_axis_matrix(axis, deg):
+    v = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}[axis]
+    R, _ = cv2.Rodrigues(np.array(v, np.float64) * np.deg2rad(deg))
+    return R.astype(np.float32)
+
+
 def poll_unity_commands(frame_bgr):
+    """Unity からの UDP コマンド。デモは Unity の UI だけで初期位置合わせ〜追跡開始ができるように、
+    OpenCV ウィンドウのキー操作に対応するコマンドを一通り受ける:
+      start / global_start / stop / quit
+      auto_align        : ADJUST 中に保存スロットから全探索して姿勢を置く（追跡は開始しない）
+      start_from_pose   : 今の姿勢から追跡開始（'f' キー相当）
+      load_pose:N / save_pose:N
+      adjust_t:x|y|z:メートル / adjust_r:x|y|z:度   （ADJUST 中の手動微調整）
+      anchor_override:A〜D / 空 = Auto
+    """
+    global pose, selected_pose_slot
     if command_socket is None:
         return
     while True:
@@ -1633,10 +2084,65 @@ def poll_unity_commands(frame_bgr):
             stop_tracking_from_unity()
         elif cmd_lower == "quit":
             raise KeyboardInterrupt
+        elif cmd_lower == "auto_align":
+            if tracking_active:
+                print("auto_align は ADJUST 中のみ（追跡中はスロットキー相当の再ロックを使う）")
+            else:
+                t_align = time.perf_counter()
+                dm = compute_edge_distance_map(frame_bgr)
+                p, slot = pose_auto_select(frame_bgr, dm, use_rotation_guard=False,
+                                           translation_search=True)
+                pose = p
+                reset_all_anchors(pose)
+                if slot is not None:
+                    selected_pose_slot = slot
+                print(f"Unity: auto_align 完了（スロット {slot} 近傍、{time.perf_counter() - t_align:.1f}s）。"
+                      "位置を確認して start_from_pose へ")
+        elif cmd_lower == "start_from_pose":
+            if not tracking_active:
+                start_tracking_from_current_pose(frame_bgr)
+        elif command.startswith("load_pose:"):
+            try:
+                slot = int(command.split(":", 1)[1])
+            except ValueError:
+                slot = selected_pose_slot
+            loaded, path = load_pose_slot(slot)
+            if loaded is not None:
+                pose = loaded
+                selected_pose_slot = slot
+                reset_all_anchors(pose)
+                if tracking_active:
+                    relock_from_frame(frame_bgr, reference_pose=loaded, use_rotation_guard=True, reason="slot")
+                print(f"Unity: スロット {slot} を読み込み")
+            else:
+                print(f"Unity: スロット {slot} は未保存")
+        elif command.startswith("save_pose:"):
+            try:
+                slot = int(command.split(":", 1)[1])
+            except ValueError:
+                slot = selected_pose_slot
+            save_pose_slot(slot, pose)
+            print(f"Unity: 現在姿勢をスロット {slot} に保存")
+        elif command.startswith("adjust_t:") or command.startswith("adjust_r:"):
+            parts = command.split(":")
+            if len(parts) == 3 and parts[1].lower() in ("x", "y", "z"):
+                axis = parts[1].lower()
+                try:
+                    amount = float(parts[2])
+                except ValueError:
+                    amount = 0.0
+                if tracking_active:
+                    print("adjust_* は ADJUST 中のみ有効")
+                elif parts[0] == "adjust_t":
+                    pose["xyz".index(axis), 3] += amount
+                    reset_all_anchors(pose)
+                else:
+                    pose[:3, :3] = _rot_axis_matrix(axis, amount) @ pose[:3, :3]
+                    reset_all_anchors(pose)
         elif command.startswith("anchor_override:"):
             global manual_anchor_override, unity_display_anchor
             key = command[len("anchor_override:"):].strip().upper()
-            if SINGLE_BODY_MODE:
+            if SINGLE_BODY_MODE and not HIERARCHICAL_ANCHORS:
                 # 追跡は 1 ボディなので切替対象は無い。Unity の強調表示用にキーだけ記録する
                 # （manual_anchor_override に "B" 等を入れると ANCHORS に無いキーで落ちるので別変数）。
                 unity_display_anchor = key if key in ("A", "B", "C", "D") else ""
@@ -1756,7 +2262,7 @@ log_writer.writerow([
     "frame", "timestamp", "mode", "quality",
     "tx", "ty", "tz",
     "r00", "r01", "r02", "r10", "r11", "r12", "r20", "r21", "r22",
-    "qA", "qB", "qC", "qD",   # 各アンカー単体の品質（quality 列は EMA 平滑化した剛体整合スコア）
+    "qA", "qB", "qC", "qD", "qF",   # 各アンカー単体の品質（quality 列は EMA 平滑化した剛体整合スコア）。F = 歯列全体
     "quality_raw",            # 平滑化前の剛体整合スコア
     # マーカー基準（登録済みのときだけ値が入る）: 追跡姿勢との差と、基準の姿勢そのもの
     "ref_key", "err_mm", "err_deg",
@@ -1789,7 +2295,7 @@ def log_frame(frame_idx, mode_text, quality, pose_mat, quality_by_key=None, qual
         f"{R[0,0]:.6f}", f"{R[0,1]:.6f}", f"{R[0,2]:.6f}",
         f"{R[1,0]:.6f}", f"{R[1,1]:.6f}", f"{R[1,2]:.6f}",
         f"{R[2,0]:.6f}", f"{R[2,1]:.6f}", f"{R[2,2]:.6f}",
-        *(f"{qk.get(k, float('nan')):.4f}" for k in ("A", "B", "C", "D")),
+        *(f"{qk.get(k, float('nan')):.4f}" for k in ("A", "B", "C", "D", "F")),
         f"{quality_raw_value:.4f}",
         *ref_cols,
     ])
@@ -1870,11 +2376,19 @@ print(f"      c=クリック位置合わせ開始（{len(LANDMARK_POINTS_MODEL)}
 print(f"      n=良姿勢の自動登録ON/OFF（デフォルトON。良品質が{AUTO_CAPTURE_MIN_GOOD_STREAK}フレーム続くとスロット"
       f"{AUTO_CAPTURE_SLOTS[0]}〜{AUTO_CAPTURE_SLOTS[-1]}に自動保存、スロット1は保護）")
 
-cv2.namedWindow("few_teeth_tracking", cv2.WINDOW_NORMAL)
-cv2.setMouseCallback("few_teeth_tracking", on_mouse)
-cv2.namedWindow("reference", cv2.WINDOW_NORMAL)
-cv2.setMouseCallback("reference", on_mouse_reference)
-cv2.imshow("reference", _render_reference())
+# Unity から起動されたとき（環境変数 M3T_HEADLESS=1）は OpenCV ウィンドウを出さない。
+# 2026-10-01 計測: cv2.waitKey(1) だけで 32 ms、HUD 描画 13 ms、レンダ 5 ms = 1 フレーム 85 ms のうち 50 ms が
+# 表示系だった（Unity 側に映像と品質バーがあるので不要）。キー操作は Unity のコマンドで代替する。
+HEADLESS = os.environ.get("M3T_HEADLESS", "0") == "1"
+_HEADLESS_SHOW = np.zeros((4, 4, 3), dtype=np.uint8)   # HUD の putText を素通しさせるためのダミー画像
+if HEADLESS:
+    print("ヘッドレスモード: OpenCV ウィンドウなし（M3T_HEADLESS=1）")
+else:
+    cv2.namedWindow("few_teeth_tracking", cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback("few_teeth_tracking", on_mouse)
+    cv2.namedWindow("reference", cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback("reference", on_mouse_reference)
+    cv2.imshow("reference", _render_reference())
 
 
 # ─── 簡易プロファイラ ───────────────────────────────────────────────────────
@@ -1952,9 +2466,11 @@ while True:
     frame_idx += 1
 
     send_video_frame_to_unity(frame_img)
+    _pf_mark("video")
     poll_unity_commands(frame_img)
+    _pf_mark("poll")
 
-    key = cv2.waitKey(1) & 0xFF
+    key = 255 if HEADLESS else (cv2.waitKey(1) & 0xFF)
     _pf_mark("waitkey")
     step_t = 0.005
     step_r = 2.0
@@ -2136,9 +2652,89 @@ while True:
                                for a in ANCHORS}
             _pf_mark("quality")
 
-            # Unityトグルからの手動オーバーライドがある場合はそれを優先し
-            # 自動切替をスキップする。Auto の場合はヒステリシス付き自動切替。
-            if manual_anchor_override:
+            last_anchor_quality = dict(quality_by_key)
+
+            if HIERARCHICAL_ANCHORS:
+                # ── Anchor Switching（階層版）────────────────────────────────────
+                # 主アンカー F（歯列全体）が十分合っていれば F。F が遮蔽などで落ちたときだけ、
+                # 適合度が高く、かつ直前の良好姿勢から大きく離れていない歯群へ切り替える。
+                group_keys = [k for k in ANCHOR_POSE_SOURCE_KEYS if k in quality_by_key]
+                display_keys = [k for k in ("A", "B", "C", "D") if k in quality_by_key]
+                best_group = max(group_keys, key=lambda k: quality_by_key[k]) if group_keys else None
+                best_display = max(display_keys, key=lambda k: quality_by_key[k]) if display_keys else None
+                qF = quality_by_key.get("F", 0.0)
+
+                def _switch_sane(p):
+                    if last_good_pose is None:
+                        return True
+                    return (rotation_angle_deg(p, last_good_pose) <= ANCHOR_SWITCH_MAX_ROT_DEG
+                            and float(np.linalg.norm(p[:3, 3] - last_good_pose[:3, 3])) <= ANCHOR_SWITCH_MAX_TRANS_M)
+
+                now_t = time.time()
+                on_group = active_anchor != "F"
+                q_cur = quality_by_key.get(active_anchor, 0.0)
+                if manual_anchor_override in ANCHOR_POSE_SOURCE_KEYS:
+                    # 手動指定: その歯群が見えている（q ≥ 0.30）ときだけ従う。見えていなければ F に退避
+                    # （見えない歯群の姿勢を出し続けると自動再ロックが連発してデモにならない）。
+                    if quality_by_key.get(manual_anchor_override, 0.0) >= 0.30:
+                        chosen = manual_anchor_override
+                    else:
+                        chosen = "F"
+                elif best_group is None:
+                    chosen = "F"
+                elif on_group:
+                    # 切替済み: ヒステリシス。F が十分回復するか、今の歯群が MIN−0.10 を割るまで維持
+                    # （0.50 で入って 0.47 で戻る…の往復を防ぐ）。最低 ANCHOR_MIN_DWELL_SEC は留まる。
+                    stay = (q_cur >= ANCHOR_GROUP_MIN_QUALITY - 0.15) and (qF < ANCHOR_F_RECOVER_QUALITY)
+                    if now_t - anchor_switch_time < ANCHOR_MIN_DWELL_SEC:
+                        stay = True
+                    # 逸脱監視: 切替時点から回り過ぎ/動き過ぎた歯群は捨てて F（保持姿勢）へ
+                    if anchor_switch_pose is not None:
+                        p_cur = poses_by_key[active_anchor]
+                        drift_deg = rotation_angle_deg(p_cur, anchor_switch_pose)
+                        drift_m = float(np.linalg.norm(p_cur[:3, 3] - anchor_switch_pose[:3, 3]))
+                        if drift_deg > ANCHOR_GROUP_MAX_DRIFT_DEG or drift_m > ANCHOR_GROUP_MAX_DRIFT_M:
+                            print(f"歯群 {active_anchor} の逸脱 ({drift_deg:.0f}°, {drift_m*1000:.0f} mm) → F へ戻す")
+                            stay = False
+                            group_block_until = now_t + ANCHOR_DRIFT_COOLDOWN_SEC
+                            quality_by_key[active_anchor] = 0.0   # このフレームでは候補にしない
+                    chosen = active_anchor if stay else "F"
+                    # より良い歯群があれば乗り換え（マージン付き）
+                    if stay and best_group != active_anchor and quality_by_key[best_group] > q_cur + ANCHOR_SWITCH_MARGIN \
+                            and _switch_sane(poses_by_key[best_group]) and now_t - anchor_switch_time >= ANCHOR_MIN_DWELL_SEC:
+                        chosen = best_group
+                elif qF >= ANCHOR_F_OK_QUALITY or now_t < group_block_until:
+                    chosen = "F"
+                elif (quality_by_key[best_group] >= ANCHOR_GROUP_MIN_QUALITY
+                      and quality_by_key[best_group] > qF + ANCHOR_SWITCH_MARGIN
+                      and _switch_sane(poses_by_key[best_group])):
+                    chosen = best_group
+                else:
+                    chosen = "F"
+                if chosen != active_anchor:
+                    print(f"アンカー切替: {active_anchor}({quality_by_key.get(active_anchor, 0):.2f}) → "
+                          f"{chosen}({quality_by_key.get(chosen, 0):.2f})  [F={qF:.2f}]")
+                    if chosen == "F":
+                        anchor_switch_pose = None
+                    elif active_anchor == "F" or anchor_switch_pose is None:
+                        # 逸脱監視の基準は「F を離れた時点」。歯群間の乗り換え（B→A など）で基準を更新すると
+                        # 20 mm 流れては乗り換え…を繰り返して 47 mm まで流れた（2026-10-01 12:35 B）。
+                        anchor_switch_pose = poses_by_key[chosen].copy()
+                    active_anchor = chosen
+                    anchor_switch_time = now_t
+                # Unity で強調する歯群: 切替中はその歯群、通常時は適合度が最も高い歯群。
+                # 通常時はヒステリシス付き（今の強調歯群より 0.10 以上良い歯群が出たときだけ乗り換える）で、
+                # 適合度が拮抗しているときに色がチラつかないようにする。
+                if chosen != "F":
+                    display_anchor = chosen
+                elif best_display is None or quality_by_key[best_display] < 0.30:
+                    display_anchor = ""
+                else:
+                    q_disp = quality_by_key.get(display_anchor, -1.0) if display_anchor in display_keys else -1.0
+                    if (display_anchor not in display_keys or q_disp < 0.30
+                            or quality_by_key[best_display] > q_disp + 2 * ANCHOR_SWITCH_MARGIN):
+                        display_anchor = best_display
+            elif manual_anchor_override:
                 if active_anchor != manual_anchor_override:
                     print(f"アンカーオーバーライド適用: {active_anchor} → {manual_anchor_override}")
                     active_anchor = manual_anchor_override
@@ -2151,9 +2747,66 @@ while True:
                     active_anchor = best_key
 
             pose = poses_by_key[active_anchor]
+            # ── 跳び量ゲート ──────────────────────────────────────────────────────
+            # M3T のボディは遮蔽や弱いエッジで 1 フレームに数十 mm 飛ぶことがある（奥行き方向が特に弱い）。
+            # 前フレームの出力から大きく跳んだ姿勢・画面外・異常な奥行きは採用せず、前フレーム姿勢に
+            # 全ボディを戻してやり直させる。実物が本当に速く動いた場合は追従が遅れるだけで、ロスト判定と
+            # 再ロックが通常どおり働く。
+            if prev_output_pose is not None and time.time() - last_recovery_time > 0.5:
+                jump_m = float(np.linalg.norm(pose[:3, 3] - prev_output_pose[:3, 3]))
+                jump_deg = rotation_angle_deg(pose, prev_output_pose)
+                depth_now = float(pose[2, 3])
+                center_now = projected_center(pose)
+                off_screen = (center_now is None or center_now[0] < 0 or center_now[0] > w
+                              or center_now[1] < 0 or center_now[1] > h)
+                hard_bad = not (POSE_DEPTH_MIN_M < depth_now < POSE_DEPTH_MAX_M) or off_screen
+                jumped = jump_m > POSE_JUMP_MAX_TRANS_M or jump_deg > POSE_JUMP_MAX_ROT_DEG
+                accept_jump = False
+                if jumped and not hard_bad:
+                    _tm = compute_tooth_mask(frame_img)
+                    q_jump = float(np.sqrt(estimate_rigid_quality(dist_map, pose) * estimate_color_quality(_tm, pose)))
+                    q_hold = float(np.sqrt(estimate_rigid_quality(dist_map, prev_output_pose)
+                                           * estimate_color_quality(_tm, prev_output_pose)))
+                    better = q_jump >= QUALITY_GOOD_THRESHOLD and q_jump >= q_hold + POSE_JUMP_ACCEPT_MARGIN
+                    same_target = (jump_target_pose is not None
+                                   and float(np.linalg.norm(pose[:3, 3] - jump_target_pose[:3, 3])) < 0.005
+                                   and rotation_angle_deg(pose, jump_target_pose) < 5.0)
+                    if better:
+                        jump_target_streak = jump_target_streak + 1 if same_target else 1
+                        jump_target_pose = pose.copy()
+                    else:
+                        jump_target_streak = 0
+                        jump_target_pose = None
+                    accept_jump = better and jump_target_streak >= POSE_JUMP_ACCEPT_FRAMES
+                    if accept_jump:
+                        print(f"跳び量ゲート: {jump_m*1000:.0f} mm / {jump_deg:.0f}° だが跳び先の方が良く合う "
+                              f"(q {q_jump:.2f} vs 保持 {q_hold:.2f}, {jump_target_streak} フレーム連続) → 受け入れ")
+                        jump_target_streak = 0
+                        jump_target_pose = None
+                elif not jumped:
+                    jump_target_streak = 0
+                    jump_target_pose = None
+                if (jumped and not accept_jump) or hard_bad:
+                    pose_jump_rejects += 1
+                    if pose_jump_rejects <= 20 or pose_jump_rejects % 50 == 0:
+                        print(f"跳び量ゲート: {jump_m*1000:.0f} mm / {jump_deg:.0f}° / 奥行き {depth_now*1000:.0f} mm"
+                              f"{' / 画面外' if off_screen else ''} → 前フレーム姿勢に戻す "
+                              f"(アンカー {active_anchor}, 累計 {pose_jump_rejects})")
+                    pose = prev_output_pose.copy()
+                    reset_all_anchors(pose)
+                    poses_by_key = {k: pose for k in poses_by_key}
+                    if active_anchor != "F":
+                        active_anchor = "F"       # 跳んだのが歯群なら F に戻す（歯群ボディは拘束が弱い）
+                        anchor_switch_pose = None
+            prev_output_pose = pose.copy()
             # ロスト/良好判定は単体アンカーの値ではなく剛体整合スコア（A/B/C 平均）で行う。
             # 1フレームの値は ±0.1 程度ばらつくので EMA で平滑化した値を判定に使う。
             quality_raw = estimate_rigid_quality(dist_map, pose)
+            quality_raw_f = quality_raw   # F ジオメトリでの剛体整合（歯群のブーストなし）
+            if HIERARCHICAL_ANCHORS and active_anchor != "F":
+                # 副アンカーで姿勢を出している間は、その歯群の適合度も「追跡できている」根拠に含める
+                # （F の適合度だけだと遮蔽中は必ず低く、HOLD/再ロックに落ちて切替の意味が無くなる）
+                quality_raw = max(quality_raw, quality_by_key.get(active_anchor, 0.0))
             quality_smoothed = (QUALITY_EMA_ALPHA * quality_raw
                                 + (1.0 - QUALITY_EMA_ALPHA) * quality_smoothed)
             last_quality = quality_smoothed
@@ -2161,8 +2814,11 @@ while True:
             if last_quality >= QUALITY_GOOD_THRESHOLD:
                 lost_streak = 0
                 lost_start_time = None
-                last_good_pose = pose.copy()
-                last_good_time = time.time()
+                # 歯群で姿勢を出している間は、歯群の適合度でブーストされた「良好」で基準姿勢を更新しない。
+                # 更新すると、流れていく歯群の姿勢が切替検査・逸脱監視・HOLD の基準になってしまう。
+                if quality_raw_f >= QUALITY_GOOD_THRESHOLD:
+                    last_good_pose = pose.copy()
+                    last_good_time = time.time()
                 recovery_escalated = False
                 # 自動登録用のストリークは GOOD よりさらに厳しい閾値で数える
                 good_streak = good_streak + 1 if last_quality >= AUTO_CAPTURE_MIN_QUALITY else 0
@@ -2221,6 +2877,9 @@ while True:
                     recovery_escalated = use_guard
                     snap_frames = SNAP_FRAME_COUNT
                     relock_reason = "auto"
+                    # 再ロック先を次フレームの跳び量ゲートが「256 mm の跳び」として元に戻してしまった
+                    # （2026-10-01 12:44。pose_auto_select に 0.4 s かかり時間ガード 0.5 s を抜けた）
+                    prev_output_pose = None
                     _pf_mark("relock")   # pose_auto_select は 5 候補 × 8 step で 200 ms 前後かかる（仕様）
 
         # ── アンカー同期（品質連動）────────────────────────────────────────────
@@ -2261,7 +2920,9 @@ while True:
                                    [cv2.IMWRITE_JPEG_QUALITY, 90]), daemon=True).start()
         _pf_mark("log")
 
-        if view_mode == 0:
+        if HEADLESS:
+            show = _HEADLESS_SHOW
+        elif view_mode == 0:
             show = viewer.view_color(False)
         elif view_mode == 1:
             show = draw_dual_wireframe(frame_img, poses_by_key, active_anchor)
@@ -2275,11 +2936,14 @@ while True:
         cv2.putText(show, f"FIT QUALITY: {last_quality:.2f} (raw {quality_raw:.2f}, anchor {active_anchor})  lost_streak: {lost_streak}{hold_text}",
                     (20, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.6, quality_color, 2)
         q_text = "   ".join(f"{a['key']}:q={quality_by_key.get(a['key'], 0.0):.2f}" for a in ANCHORS)
+        if HIERARCHICAL_ANCHORS:
+            q_text = f"POSE from {active_anchor}   highlight {display_anchor or 'ALL'}   " + q_text
         cv2.putText(show, q_text, (20, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         # マーカー基準との差（登録済みなら mm/deg、未登録なら登録を促す）
         if marker_ref is not None:
-            marker_ref.draw(show)
+            if not HEADLESS:
+                marker_ref.draw(show)
             if marker_ref.last is None:
                 ref_text, ref_color = "REF: marker not visible", (120, 120, 120)
             elif marker_err is not None:
@@ -2289,8 +2953,11 @@ while True:
                 ref_text = (f"REF({marker_err['key']}, {_reg}): err {marker_err['mm']:.1f} mm / {marker_err['deg']:.1f} deg"
                             f"   (dx,dy,dz)=({marker_err['dx_mm'][0]:+.1f},{marker_err['dx_mm'][1]:+.1f},{marker_err['dx_mm'][2]:+.1f})")
                 ref_color = (255, 255, 0)
-                # マーカーから予測した歯牙姿勢を白い細線で重ねる（追跡結果との視覚比較用）
+                # マーカーから予測した歯牙姿勢を白い細線で重ねる（追跡結果との視覚比較用）。
+                # 階層アンカーでは F だけ描けば全歯を覆う。
                 for a in ANCHORS:
+                    if HEADLESS or (HIERARCHICAL_ANCHORS and a["key"] != "F"):
+                        continue
                     _draw_wireframe_into(show, marker_err["predicted"].astype(np.float32),
                                          a["viz_draw_vertices"], a["viz_draw_edges"], (255, 255, 255), 1)
             else:
@@ -2305,9 +2972,10 @@ while True:
             pose_to_smooth = last_good_pose
         display_pose = smooth_pose(pose_to_smooth)
     else:
-        show = draw_dual_wireframe(frame_img, {a["key"]: pose for a in ANCHORS}, active_anchor)
+        show = _HEADLESS_SHOW if HEADLESS else draw_dual_wireframe(frame_img, {a["key"]: pose for a in ANCHORS}, active_anchor)
         if marker_ref is not None:
-            marker_ref.draw(show)
+            if not HEADLESS:
+                marker_ref.draw(show)
             # ADJUST 中も登録状態を表示（'M' で消えたか、何件登録済みかが分かるように）
             if marker_ref.last is None:
                 _t, _c = "REF: marker not visible", (120, 120, 120)
@@ -2355,10 +3023,11 @@ while True:
                     (20, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
 
     _pf_mark("draw")
-    cv2.imshow("few_teeth_tracking", show)
-    if _ref_view["dirty"]:
-        cv2.imshow("reference", _render_reference())
-        _ref_view["dirty"] = False
+    if not HEADLESS:
+        cv2.imshow("few_teeth_tracking", show)
+        if _ref_view["dirty"]:
+            cv2.imshow("reference", _render_reference())
+            _ref_view["dirty"] = False
     _pf_mark("imshow")
     _pf_end()
 
