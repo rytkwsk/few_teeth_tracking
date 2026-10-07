@@ -39,7 +39,8 @@ if os.name == "nt" and os.path.isdir(_conda_lib_bin):
 
 # few_teeth_tracking は pym3t とは別ディレクトリに配置されているため、
 # pym3t.pyd 等の所在地を明示的に指定する。
-PYM3T_DIR = r"C:\Users\rytkw\Projects\pym3t"
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+PYM3T_DIR = os.path.abspath(os.environ.get("PYM3T_DIR", os.path.join(os.path.dirname(REPO_DIR), "pym3t")))
 sys.path.insert(0, PYM3T_DIR)
 
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"

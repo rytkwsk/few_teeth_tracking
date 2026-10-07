@@ -14,7 +14,8 @@ if os.name == "nt" and os.path.isdir(_conda_lib_bin):
         os.add_dll_directory(_conda_lib_bin)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, r"C:\Users\rytkw\Projects\pym3t")
+PYM3T_DIR = os.path.abspath(os.environ.get("PYM3T_DIR", os.path.join(os.path.dirname(SCRIPT_DIR), "pym3t")))
+sys.path.insert(0, PYM3T_DIR)
 import numpy as np
 import pym3t
 
