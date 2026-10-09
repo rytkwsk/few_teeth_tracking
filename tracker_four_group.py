@@ -223,6 +223,23 @@ ANCHOR_DRIFT_COOLDOWN_SEC = 1.5
 # 回転 20° の誤りは歯列の反対側を 17 mm 動かす。歯群で肩代わりする間は「歯群の歯の位置」だけを採用し、
 # 回転は F を離れた時点のものを保つ（遮蔽中に模型を回す場面は捨てる）。逸脱監視も歯群中心の並進だけで行う。
 GROUP_ROTATION_FROM_F     = True
+# ── ① F 復帰時の回転再探索（2026-10-09）──────────────────────────────────────
+# 統合中は回転を F 離脱時のまま固定するため、遮蔽中に模型が回ると F 復帰後も古い回転の局所解に落ちる
+# （ArUco 実測: 復帰後 11〜16° が残り、q は 0.56〜0.64 と「良好」に見えたまま）。復帰の瞬間だけ、歯列重心
+# まわりに回転した候補を M3T で数ステップ精密化し、剛体整合スコアが無回転より十分良いときだけ採用する。
+RETURN_ROT_SEARCH_ENABLED = os.environ.get("M3T_RETURN_SEARCH", "1") != "0"
+RETURN_ROT_SEARCH_DEGS    = {"y": (6.0, 12.0, 18.0), "x": (8.0,), "z": (8.0,)}   # カメラ座標の軸ごとの候補角（±）。y=鉛直まわり（机上で回す）が主
+RETURN_ROT_SEARCH_STEPS   = 2      # 候補ごとの M3T 反復。3→2 (2026-10-09 14:42 run: 11 候補 × 3 step = 0.48 s が重い)
+RETURN_ROT_ACCEPT_MARGIN  = 0.03   # 無回転候補の剛体スコアよりこれ以上良いときだけ採用（q は 15° ずれても 0.6 出るので慎重に）
+# 再探索は 1 回 0.48 s 止まる。14:34 run では F の離脱→復帰が 150 s に 22 回（5〜7 s に 1 回）あり、全部で走らせると
+# 約 7% の時間が停止になった。1〜2 s の短い離脱では回転はほぼ動かないので、長い遮蔽か大きな移動のときだけ走らせる。
+RETURN_ROT_SEARCH_MIN_OCCL_SEC = 1.5    # 離脱がこれ以上続いたときだけ再探索（1.0 では 14:42 run の 19 回全部が通り、1.0〜1.4 s の 7 回は補正 0°）
+RETURN_ROT_SEARCH_MIN_MOVE_M   = 0.006  # または離脱中に歯列重心がこれ以上動いたとき（回転で重心も動くため）
+# ── ② 回転不確か警告 ────────────────────────────────────────────────────────
+# 統合中（回転固定）が長い／歯列が大きく動いた／HOLD 中は、出力の回転が古い可能性があることを Unity に伝える。
+ROT_UNCERTAIN_AFTER_SEC   = 2.0    # 統合（回転固定）がこれ以上続いたら警告
+ROT_UNCERTAIN_MOVE_M      = 0.010  # 統合中に歯列重心が離脱時からこれ以上動いたら警告（動いたなら回ってもいる可能性）
+ROT_UNCERTAIN_AFTER_RETURN_SEC = 2.0   # F 復帰後、この秒数は警告を維持（再探索の結果を人が確認できるように）
 # Unity の強調表示: True = F 出力中も最良歯群に色を付ける（旧動作、色がちらつく）。False = 肩代わり中の歯群だけ色を付け、
 # F 出力中は全体を同色で表示する。
 DISPLAY_BEST_GROUP_WHEN_F = False
@@ -250,7 +267,12 @@ arch_model_path = os.path.join(SCRIPT_DIR, "models", ARCH_MODEL_NAME)
 
 # M3T の texture modality（実画像の特徴点で相対運動を拘束。モデルにテクスチャは不要）。
 # 奥行き方向の暴走に効く可能性があるが未検証。
-USE_TEXTURE_MODALITY = False
+# 2026-10-09 ArUco 実測（texture OFF, F のみ, 18.5 cm）: 誤差 中央値 2.7 mm / 2.9°、軸別ゆらぎは x（≒歯列方向）1.8 mm >
+# z 1.6 mm > y 0.7 mm、フレーム間変化は中央値 0.27 mm（高周波ノイズではなくゆっくり滑る）。歯列方向の滑り（歯の
+# 周期性によるあいまいさ）を実画像の特徴点で拘束できるかを ON で A/B 検証中。env M3T_TEXTURE=0/1 で上書き可。
+# A/B 結果（遮蔽なし F, 各 1 run）: OFF 中央値 2.7 mm / 2.9°（p90 4.7 mm）→ ON 1.6 mm / 2.5°（p90 3.7 mm）。
+# m3t_step 6→15 ms だがカメラ 24 fps 律速のままで fps 低下なし。暫定で既定 ON（再現確認待ち）。
+USE_TEXTURE_MODALITY = os.environ.get("M3T_TEXTURE", "1") != "0"
 
 # 2アンカーは同じ typodont 座標系を共有するため姿勢スロットも共有でよいが、
 # 単独運用の tracker_premolar_canine.py / tracker_canine.py の initial_poses/
@@ -282,7 +304,8 @@ UNITY_UDP_PORT      = 5005
 UNITY_COMMAND_PORT  = 5006
 UNITY_VIDEO_ENABLED = True
 UNITY_VIDEO_PORT    = 5010
-UNITY_VIDEO_FPS     = 20   # エンコードは別スレッドなので 10→20（背景のカクつき低減）
+UNITY_VIDEO_FPS     = 30   # 10→20→30: カメラは 24 fps 固定（2026-10-09 実測）なので 20 で間引くと
+                           # テンポずれと最大 50 ms の表示遅れが出る。30 なら全フレーム送る（エンコードは別スレッド）
 # Unity へ送る映像の幅。カメラが 720p になったので等倍で送る（640 だと Game ビュー拡大時にぼける）。
 # Unity 側 M3TCameraIntrinsics の imageWidth/imageHeight/fx/fy/cx/cy はこの送信解像度に合わせること
 # （現在: 1280x720, newK fx=1001.6 fy=1024.0 cx=640.2 cy=334.5）。
@@ -493,6 +516,54 @@ if CAMERA_MANUAL_EXPOSURE is not None:
 
 h, w = frame.shape[:2]
 
+
+# ─── カメラ読み取りの別スレッド化（ラグ対策） ─────────────────────────────────
+# cap.read() をメインループで直接呼ぶと、M3T と品質評価の間にドライバ側へ溜まった
+# 「古い」フレームを次に受け取ることになり、画面の遅れ（ラグ）として見える。
+# 読み取りを専用スレッドに移し、メインループは常に最新の 1 枚だけを処理する。
+# このカメラは解像度・露出・バックエンドに依らず 24 fps 固定（2026-10-09 実測）なので
+# fps は変わらないが、処理・表示するフレームの鮮度が上がる。
+# 注意: '[' ']' の露出変更は別スレッドの read と並行して cap.set を呼ぶ（DSHOW では実用上問題なし）。
+class _LatestFrameGrabber:
+    def __init__(self, capture):
+        self._cap = capture
+        self._cond = threading.Condition()
+        self._frame = None
+        self._seq = 0
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while self._running:
+            ret, frame = self._cap.read()
+            with self._cond:
+                if ret:
+                    self._frame = frame
+                    self._seq += 1
+                self._cond.notify_all()
+            if not ret:
+                time.sleep(0.005)
+
+    def read(self, last_seq, timeout=0.5):   # 0.5 s × FRAME_READ_RETRY_LIMIT(120) ≒ 60 s でカメラ停止を検知
+        """last_seq より新しいフレームが届くまで待ち (ret, frame, seq) を返す。timeout で (False, None, last_seq)。"""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._seq <= last_seq:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False, None, last_seq
+                self._cond.wait(remaining)
+            return True, self._frame, self._seq
+
+    def stop(self):
+        self._running = False
+        self._thread.join(timeout=1.0)
+
+
+_grabber = _LatestFrameGrabber(cap)
+_frame_seq = 0
+
 # 品質評価（方向付きエッジ距離マップ）は 640 幅相当に縮小して計算する。
 #  - 速度: 720p では 9 枚の距離変換が 3 倍重くなり fps が 13 → 6.7 に落ちた（2026-09-21）
 #  - 値の一貫性: QUALITY_EDGE_MAX_DIST_PX（4 px）や閾値は 640x480 の実測で決めたもの。
@@ -514,6 +585,13 @@ K = np.array([
 dist = None
 undistort_map = None
 
+# 歪み補正の ON/OFF（A/B 検証用、2026-10-09）。モニター表示のチェッカーボードで取った npz は高次の
+# 歪み係数（k2=-1.6, k3=3.0）が大きく、remap が画像を微妙に歪めて全アンカーの適合度を一律に下げている
+# 疑いがある。OFF のときはキャリブの K をそのまま使い、歪み係数は使わない（画像は無補正）。
+# 環境変数 M3T_UNDISTORT=1/0 で上書き可。
+# A/B 結果 (2026-10-09 12:44 run): OFF でも剛体スコア中央値 0.351→0.347 と不変 → 歪み補正は原因ではない。既定 ON に戻した。
+UNDISTORT_ENABLED = os.environ.get("M3T_UNDISTORT", "1") != "0"
+
 if os.path.exists(calibration_path):
     calib = np.load(calibration_path)
     calib_w = int(calib["image_width"][0])
@@ -521,11 +599,15 @@ if os.path.exists(calibration_path):
     if calib_w == w and calib_h == h:
         K    = calib["K"].astype(np.float32)
         dist = calib["dist"].astype(np.float32)
-        new_K, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 0, (w, h))
-        undistort_map = cv2.initUndistortRectifyMap(
-            K, dist, None, new_K.astype(np.float32), (w, h), cv2.CV_16SC2)
-        K = new_K.astype(np.float32)
-        print("カメラキャリブレーション読み込み完了")
+        if UNDISTORT_ENABLED:
+            new_K, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 0, (w, h))
+            undistort_map = cv2.initUndistortRectifyMap(
+                K, dist, None, new_K.astype(np.float32), (w, h), cv2.CV_16SC2)
+            K = new_K.astype(np.float32)
+            print("カメラキャリブレーション読み込み完了（歪み補正 ON）")
+        else:
+            dist = None
+            print("カメラキャリブレーション読み込み完了（歪み補正 OFF: K のみ使用）")
     else:
         print(f"キャリブレーション解像度不一致: {calib_w}x{calib_h} vs {w}x{h}")
 else:
@@ -948,6 +1030,49 @@ def _fuse_groups(keys, poses_by_key, ref_pose):
     out[:3, :3] = R
     out[:3, 3] = t_sum / w_sum
     return out
+
+
+def _rotate_pose_about_arch_center(pose_mat, axis, deg):
+    """歯列全体の重心（カメラ座標）を中心に、カメラ座標の軸 axis まわりに deg 回した姿勢を返す。"""
+    Rd = _rot_axis_matrix(axis, deg)
+    R, t = pose_mat[:3, :3], pose_mat[:3, 3]
+    c_cam = R @ ANCHOR_BY_KEY["F"]["centroid"] + t
+    out = pose_mat.copy().astype(np.float32)
+    out[:3, :3] = Rd @ R
+    out[:3, 3] = Rd @ (t - c_cam) + c_cam
+    return out
+
+
+def return_rotation_search(frame_bgr, dist_map, base_pose):
+    """統合解除 → F の瞬間に呼ぶ。base_pose（回転は F 離脱時のまま）の周りに回転候補を置き、各候補を
+    M3T で RETURN_ROT_SEARCH_STEPS 回精密化して剛体整合スコアで比べる。無回転候補より
+    RETURN_ROT_ACCEPT_MARGIN 以上良い候補があればそれを採用する。
+    返り値: (採用姿勢, base からの回転量[deg], 無回転のスコア, 採用スコア, 所要秒)"""
+    t0 = time.perf_counter()
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    cands = [("none", 0.0, base_pose.copy().astype(np.float32))]
+    for axis, degs in RETURN_ROT_SEARCH_DEGS.items():
+        for d in degs:
+            for s in (1.0, -1.0):
+                cands.append((axis, s * d, _rotate_pose_about_arch_center(base_pose, axis, s * d)))
+    results = []
+    for axis, d, cand in cands:
+        reset_all_anchors(cand)
+        for _ in range(RETURN_ROT_SEARCH_STEPS):
+            tracker.step(frame_rgb)
+        refined = ANCHOR_BY_KEY["F"]["model"].pose_cv.copy().astype(np.float32)
+        results.append((estimate_rigid_quality(dist_map, refined), axis, d, refined))
+    base_q = results[0][0]
+    best = max(results, key=lambda r: r[0])
+    chosen = best if best[0] >= base_q + RETURN_ROT_ACCEPT_MARGIN else results[0]
+    reset_all_anchors(chosen[3])
+    delta = rotation_angle_deg(chosen[3], base_pose)
+    dt = time.perf_counter() - t0
+    top = sorted(results, key=lambda r: -r[0])[:4]
+    print(f"復帰時回転再探索: 無回転 q={base_q:.2f} → 採用 {chosen[1]}{chosen[2]:+.0f}° q={chosen[0]:.2f} "
+          f"(base からの回転 {delta:.1f}°, {dt*1000:.0f} ms)  上位: "
+          + ", ".join(f"{a}{d:+.0f}°={q:.2f}" for q, a, d, _ in top))
+    return chosen[3], delta, base_q, chosen[0], dt
 
 
 def reset_all_anchors(pose_mat):
@@ -2048,6 +2173,11 @@ jump_target_pose = None      # ゲートが拒否した跳び先（連続性の�
 jump_target_streak = 0
 gate_reject_streak = 0       # ゲートが連続して拒否したフレーム数（固着検出）
 force_relock = False         # 固着検出で自動再ロックを強制するフラグ
+rotation_uncertain_until = 0.0         # ② F 復帰後、この時刻までは「回転不確か」警告を維持
+rotation_uncertain_after_return = ""   # ② 復帰時の警告文
+rotation_uncertain_reason = ""         # ② 今フレームの警告理由（空 = 警告なし）。Unity へ送る
+frame_event = ""                       # CSV の event 列（復帰時回転再探索の結果など、そのフレームの特記事項）
+group_poses_raw = None                 # ⑤ M3T ステップ直後の各歯群ボディの姿勢（統合で上書きされる前のもの）
 pose_jump_rejects = 0        # ゲートで捨てた回数（ログ用）
 relock_fail_count = 0        # 自動再ロックの連続失敗回数（エスカレーション用）
 _auto_select_info = {"quality": 0.0}   # pose_auto_select が最後に選んだ候補の品質
@@ -2135,6 +2265,28 @@ unity_udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if UNITY_UDP_E
 last_anchor_quality = {}   # 直近フレームの各アンカー単体適合度（Unity 送信・HUD 用）
 
 
+def _marker_payload():
+    err = globals().get("marker_err")
+    registered = marker_ref is not None and bool(marker_ref.T_ref_model)
+    n_samples = 0
+    if marker_ref is not None and marker_ref.last is not None:
+        n_samples = len(marker_ref.samples.get(marker_ref.last["key"], []))
+    elif marker_ref is not None:
+        n_samples = sum(len(v) for v in marker_ref.samples.values())
+    return {
+        "marker_registered": registered,
+        "marker_visible": marker_ref is not None and marker_ref.last is not None,
+        "marker_valid": err is not None,
+        "marker_err_mm": float(err["mm"]) if err is not None else 0.0,
+        "marker_err_deg": float(err["deg"]) if err is not None else 0.0,
+        "marker_samples": int(n_samples),
+        "marker_msg": globals().get("marker_status_text", ""),
+        # ② 回転不確か警告（統合中の回転固定が長い／大きく動いた／HOLD 中／F 復帰直後）
+        "rotation_uncertain": bool(globals().get("rotation_uncertain_reason", "")),
+        "rotation_uncertain_reason": globals().get("rotation_uncertain_reason", ""),
+    }
+
+
 def send_pose_to_unity(pose_mat, mode_text):
     if unity_udp_sock is None:
         return
@@ -2155,6 +2307,14 @@ def send_pose_to_unity(pose_mat, mode_text):
         "timestamp": time.time(),
         "mode": mode_text,
         "pose_cv": pose_mat.astype(float).reshape(16).tolist(),
+        # M3T に渡したのと同じ（歪み補正後の）内部パラメータ。Unity の M3TCameraIntrinsics がこれで投影を
+        # 合わせる。以前は Unity 側に手書きの K があり、再キャリブ後に fx 1001.6 vs 1146.6 とずれて
+        # 重畳が画像端で 30〜77 px 外れていた（2026-10-09）。
+        "K": [float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])],
+        "image_size": [int(w), int(h)],
+        # ArUco 基準との実測誤差（fit quality は代理指標なので、精度はこちらで見る）。
+        # marker_err はメインループでこの送信の直前に計算される。
+        **_marker_payload(),
     }, separators=(",", ":")).encode("utf-8")
     unity_udp_sock.sendto(payload, (UNITY_UDP_HOST, UNITY_UDP_PORT))
 
@@ -2183,6 +2343,51 @@ def _rot_axis_matrix(axis, deg):
     v = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}[axis]
     R, _ = cv2.Rodrigues(np.array(v, np.float64) * np.deg2rad(deg))
     return R.astype(np.float32)
+
+
+marker_status_text = ""   # 直近のマーカー登録操作の結果（Unity パネルに表示する）
+
+
+def register_marker_sample():
+    """'m' キー / Unity の marker_register。今の pose を正としてマーカー→モデルの変換を 1 サンプル登録する。
+    誤登録を防ぐ安全チェックは従来の 'm' キーのものと同じ。"""
+    global marker_status_text
+    if marker_ref is None:
+        msg = "マーカー基準は無効です（MARKER_REF_ENABLED=False）"
+    elif marker_ref.last is None:
+        msg = "マーカーが検出されていないため登録できません"
+    elif tracking_active and (time.time() - last_recovery_time < 3.0 or lost_streak > 0):
+        # 再ロック直後は quality_smoothed が 1.0 に初期化されていて低品質判定をすり抜ける。
+        # 2026-09-21 19:02 に HOLD/SNAP ループ中の姿勢が 2 件登録された事故があったため拒否する。
+        msg = "再ロック直後 / 品質低下中は登録できません。数秒安定してから押してください"
+    elif tracking_active and snap_frames > 0:
+        # 2026-09-09: 自動リカバリ中（SNAP）にズレた姿勢を登録してしまった事故があったため拒否する
+        msg = "SNAP（再ロック）中は登録できません。追跡が落ち着いて合っているのを確認してから押してください"
+    elif tracking_active and last_quality < QUALITY_LOSS_THRESHOLD:
+        msg = (f"品質が低い（{last_quality:.2f} < {QUALITY_LOSS_THRESHOLD}）ため登録しません。"
+               "PnP クリック初期化の直後（ADJUST のまま）に押すのが確実です")
+    else:
+        k = marker_ref.register(pose)
+        s = marker_ref.summary(k)
+        msg = (f"マーカー基準にサンプル追加: {k}（{marker_ref.last['n_markers']} 枚, 再投影 {marker_ref.last['rms_px']:.2f}px）"
+               f" → 登録 {s['n']} 件中 {s['n_used']} 件（外れ値除外後）の平均を基準に使用。"
+               f" ばらつき: RMS {s['rms_mm']:.1f} mm / {s['rms_deg']:.1f} deg, 最大 {s['max_mm']:.1f} mm / {s['max_deg']:.1f} deg")
+        if s["n"] < 3:
+            msg += "  → 視点・距離を変えてあと数回登録すると偶発誤差が平均化されます（取り消しは直近 1 件ずつ）"
+    print(msg)
+    marker_status_text = msg
+
+
+def undo_marker_sample():
+    """Backspace / Unity の marker_undo。直近の登録サンプルを 1 件取り消す。"""
+    global marker_status_text
+    if marker_ref is None:
+        return
+    k = marker_ref.undo_last_sample()
+    s = marker_ref.summary(k) if k else None
+    msg = f"マーカー基準サンプルを 1 件取り消し: {k} → 残り {s['n'] if s else 0} 件" if k else "取り消せるサンプルがありません"
+    print(msg)
+    marker_status_text = msg
 
 
 def poll_unity_commands(frame_bgr):
@@ -2258,6 +2463,10 @@ def poll_unity_commands(frame_bgr):
                 slot = selected_pose_slot
             save_pose_slot(slot, pose)
             print(f"Unity: 現在姿勢をスロット {slot} に保存")
+        elif cmd_lower == "marker_register":   # 'm' キー相当（安全チェック込み）
+            register_marker_sample()
+        elif cmd_lower == "marker_undo":       # Backspace 相当。全消去は誤操作防止のため 'x' キーのみ
+            undo_marker_sample()
         elif command.startswith("adjust_t:") or command.startswith("adjust_r:"):
             parts = command.split(":")
             if len(parts) == 3 and parts[1].lower() in ("x", "y", "z"):
@@ -2423,6 +2632,14 @@ log_writer.writerow([
     "ref_tx", "ref_ty", "ref_tz", "ref_rx", "ref_ry", "ref_rz",
     "ref_n_samples",          # 基準（マーカー→モデル変換）の登録サンプル数（平均化に使った件数）
     "anchor_switching",       # 2 = 統合（見えている歯群すべて）、1 = 最良 1 歯群を選択、0 = 比較用ベースライン（F のみ）
+    # ⑤ 歯群ごとの回転精度（マーカー登録済みのときだけ）: 各歯群ボディ自身の姿勢とマーカー予測姿勢の差。
+    #   g?_rot_deg = 回転差、g?_cen_mm = 歯群重心の 3D 差、g?_cen_depth_mm = そのうちカメラ光線方向の成分
+    "gA_rot_deg", "gA_cen_mm", "gA_cen_depth_mm",
+    "gB_rot_deg", "gB_cen_mm", "gB_cen_depth_mm",
+    "gD_rot_deg", "gD_cen_mm", "gD_cen_depth_mm",
+    "gF_rot_deg",             # F ボディ（統合中は統合姿勢＝固定回転）の回転差
+    "event",                  # 特記事項（復帰時回転再探索の結果など）
+    "rot_uncertain",          # ② 「回転不確か」警告が出ていたフレームは 1
 ])
 
 diag_frame_dir = None
@@ -2432,9 +2649,10 @@ if DIAG_FRAME_DUMP_EVERY > 0:
 
 
 def log_frame(frame_idx, mode_text, quality, pose_mat, quality_by_key=None, quality_raw_value=float("nan"),
-              marker_err=None):
+              marker_err=None, group_poses=None, event="", rot_uncertain=0):
     R, t = pose_mat[:3, :3], pose_mat[:3, 3]
     qk = quality_by_key or {}
+    gcols = [""] * 10
     if marker_err is not None:
         P = marker_err["predicted"]
         rv, _ = cv2.Rodrigues(P[:3, :3].astype(np.float64))
@@ -2442,6 +2660,24 @@ def log_frame(frame_idx, mode_text, quality, pose_mat, quality_by_key=None, qual
                     f"{P[0,3]:.6f}", f"{P[1,3]:.6f}", f"{P[2,3]:.6f}",
                     f"{rv[0,0]:.6f}", f"{rv[1,0]:.6f}", f"{rv[2,0]:.6f}",
                     str(marker_err.get("n_samples", ""))]
+        if group_poses:
+            # ⑤ 歯群ボディ自身の姿勢（統合では重心位置だけを使い回転は捨てている）がどれだけ正しいかを記録する。
+            gcols = []
+            for k in ("A", "B", "D"):
+                pk = group_poses.get(k)
+                if pk is None:
+                    gcols += ["", "", ""]
+                    continue
+                c = ANCHOR_BY_KEY[k]["centroid"]
+                c_trk = pk[:3, :3] @ c + pk[:3, 3]
+                c_prd = P[:3, :3] @ c + P[:3, 3]
+                d = c_trk - c_prd
+                ray = c_prd / max(float(np.linalg.norm(c_prd)), 1e-9)
+                gcols += [f"{rotation_angle_deg(pk, P):.3f}",
+                          f"{float(np.linalg.norm(d)) * 1000.0:.3f}",
+                          f"{float(np.dot(d, ray)) * 1000.0:.3f}"]
+            pf = group_poses.get("F")
+            gcols.append(f"{rotation_angle_deg(pf, P):.3f}" if pf is not None else "")
     else:
         ref_cols = ["", "", "", "", "", "", "", "", "", ""]
     log_writer.writerow([
@@ -2454,6 +2690,9 @@ def log_frame(frame_idx, mode_text, quality, pose_mat, quality_by_key=None, qual
         f"{quality_raw_value:.4f}",
         *ref_cols,
         ("2" if anchor_fusion_enabled else "1") if anchor_switching_enabled else "0",
+        *gcols,
+        event,
+        rot_uncertain,
     ])
 
 
@@ -2597,7 +2836,7 @@ def _pf_end():
 
 while True:
     _pf_begin()
-    ret, raw = cap.read()
+    ret, raw, _frame_seq = _grabber.read(_frame_seq)   # 最新フレームのみ（別スレッド読み取り）
     if not ret:
         frame_read_failures += 1
         if frame_read_failures == 1:
@@ -2615,6 +2854,7 @@ while True:
     _pf_mark("capture")
     frame_raw = frame_img          # 保存・マーカー検出用の未加工フレーム
     marker_err = None
+    frame_event = ""
     if marker_ref is not None:
         marker_ref.detect(frame_raw)
         if MARKER_MASK_FOR_TRACKER and marker_ref.last is not None:
@@ -2720,33 +2960,9 @@ while True:
         pose[:3, :3] = rot_z(-step_r) @ pose[:3, :3]
     elif key == ord("m"):
         # 追跡が合っていると判断した瞬間に押す。今の pose を正としてマーカー→モデルの変換を登録
-        if marker_ref is None:
-            print("マーカー基準は無効です（MARKER_REF_ENABLED=False）")
-        elif marker_ref.last is None:
-            print("マーカーが検出されていないため登録できません")
-        elif tracking_active and (time.time() - last_recovery_time < 3.0 or lost_streak > 0):
-            # 再ロック直後は quality_smoothed が 1.0 に初期化されていて低品質判定をすり抜ける。
-            # 2026-09-21 19:02 に HOLD/SNAP ループ中の姿勢が 2 件登録された事故があったため拒否する。
-            print("再ロック直後 / 品質低下中は登録できません。数秒安定してから押してください")
-        elif tracking_active and snap_frames > 0:
-            # 2026-09-09: 自動リカバリ中（SNAP）にズレた姿勢を登録してしまった事故があったため拒否する
-            print("SNAP（再ロック）中は登録できません。追跡が落ち着いて合っているのを確認してから押してください")
-        elif tracking_active and last_quality < QUALITY_LOSS_THRESHOLD:
-            print(f"品質が低い（{last_quality:.2f} < {QUALITY_LOSS_THRESHOLD}）ため登録しません。"
-                  "PnP クリック初期化の直後（ADJUST のまま）に押すのが確実です")
-        else:
-            k = marker_ref.register(pose)
-            s = marker_ref.summary(k)
-            print(f"マーカー基準にサンプル追加: {k}（{marker_ref.last['n_markers']} 枚, 再投影 {marker_ref.last['rms_px']:.2f}px）"
-                  f" → 登録 {s['n']} 件中 {s['n_used']} 件（外れ値除外後）の平均を基準に使用。"
-                  f" ばらつき: RMS {s['rms_mm']:.1f} mm / {s['rms_deg']:.1f} deg, 最大 {s['max_mm']:.1f} mm / {s['max_deg']:.1f} deg")
-            if s["n"] < 3:
-                print("  → 視点・距離を変えて PnP 初期化をやり直し、あと数回 'm' を押すと偶発誤差が平均化されます（Backspace で直近 1 件を取り消し）")
+        register_marker_sample()
     elif key == 8:  # Backspace: 直近の登録サンプルを 1 件取り消す
-        if marker_ref is not None:
-            k = marker_ref.undo_last_sample()
-            s = marker_ref.summary(k) if k else None
-            print(f"マーカー基準サンプルを 1 件取り消し: {k} → 残り {s['n'] if s else 0} 件" if k else "取り消せるサンプルがありません")
+        undo_marker_sample()
     elif key in (ord("x"), ord("M")):
         # 'x' = 登録を全消去（Shift 不要。'M' は環境によって 'm' として届くことがあった）
         if marker_ref is not None:
@@ -2798,6 +3014,9 @@ while True:
         # active_anchor の pose に全アンカーを同期する（後段で reset_all_anchors）。
         _pf_mark("m3t_step")
         poses_by_key = {a["key"]: a["model"].pose_cv.copy().astype(np.float32) for a in ANCHORS}
+        # ⑤ 各歯群ボディ自身の推定（回転込み）。この後の統合／同期で poses_by_key は出力姿勢に上書きされるので、
+        # ログ用にここで控えておく（14:34 run で A/B/D の回転誤差が全部 F と同じ値になっていた原因）。
+        group_poses_raw = {k: p.copy() for k, p in poses_by_key.items()}
         pose = poses_by_key[active_anchor]
         quality_by_key = {}  # SNAPウォームアップ中は未評価（HUD表示は0.0のまま）
         if snap_frames > 0:
@@ -2952,6 +3171,14 @@ while True:
                         reason = "使える歯群なし"
                     if reason is not None:
                         print(f"統合解除 → F (F={qF_:.2f}, {reason})")
+                        # 離脱中にどれだけ経ち・動いたか（① 再探索と ② 警告の要否判定）。状態をクリアする前に計算する
+                        _occl_sec = now_t - anchor_switch_time
+                        _occl_moved = (float(np.linalg.norm(_group_center_cam("F", fusion_hold_pose)
+                                                            - _group_center_cam("F", anchor_switch_pose)))
+                                       if fusion_hold_pose is not None and anchor_switch_pose is not None else 0.0)
+                        _warn_rot = _occl_sec >= ROT_UNCERTAIN_AFTER_SEC or _occl_moved >= ROT_UNCERTAIN_MOVE_M
+                        _do_search = (RETURN_ROT_SEARCH_ENABLED
+                                      and (_occl_sec >= RETURN_ROT_SEARCH_MIN_OCCL_SEC or _occl_moved >= RETURN_ROT_SEARCH_MIN_MOVE_M))
                         fusion_off_f = False
                         fusion_active = False
                         fusion_keys = []
@@ -2959,6 +3186,24 @@ while True:
                         fusion_enter_streak = {}
                         fusion_hold_pose = None
                         anchor_switch_pose = None
+                        # ② 長い遮蔽／大きな移動の後は、復帰後しばらく「回転不確か」を出す（人が重畳を確認できるように）
+                        if _warn_rot:
+                            rotation_uncertain_until = now_t + ROT_UNCERTAIN_AFTER_RETURN_SEC
+                            rotation_uncertain_after_return = (f"F resumed after {_occl_sec:.0f}s occlusion "
+                                                               f"({_occl_moved*1000:.0f}mm moved) - verify alignment")
+                        # ① 回転が古い疑いがあるときだけ、固定していた回転の周りを再探索して古い局所解から抜ける
+                        _occl_text = f"occl{_occl_sec:.1f}s/{_occl_moved*1000:.0f}mm"
+                        if _do_search:
+                            _rp, _rdeg, _q0, _q1, _rdt = return_rotation_search(frame_img, dist_map, poses_by_key["F"])
+                            poses_by_key = {k: _rp for k in poses_by_key}
+                            pose = _rp
+                            prev_output_pose = None   # 再探索先を跳び量ゲートが「跳び」として戻さないように
+                            frame_event = f"return_search:{_rdeg:.1f}deg q{_q0:.2f}->{_q1:.2f} {_rdt*1000:.0f}ms {_occl_text}"
+                            if _rdeg >= 3.0:
+                                rotation_uncertain_until = now_t + ROT_UNCERTAIN_AFTER_RETURN_SEC
+                                rotation_uncertain_after_return = f"rotation corrected by {_rdeg:.0f} deg on return - verify alignment"
+                        else:
+                            frame_event = f"return_no_search {_occl_text}"
                 if fusion_off_f:
                     # 歯群の採用判定（スコアと逸脱の両方にヒステリシス）。逸脱は直前の出力姿勢から予測した重心との差。
                     new_members, dropped = {}, []
@@ -3219,12 +3464,27 @@ while True:
             reset_all_anchors(last_good_pose)
             poses_by_key = {a["key"]: last_good_pose for a in ANCHORS}
 
+        # ── ② 回転不確か警告: 統合中（回転固定）が長い／大きく動いた、HOLD 中、F 復帰直後 ──
+        rotation_uncertain_reason = ""
+        if fusion_off_f and anchor_switch_pose is not None:
+            _since = time.time() - anchor_switch_time
+            _ref_pose = fusion_hold_pose if fusion_hold_pose is not None else anchor_switch_pose
+            _moved = float(np.linalg.norm(_group_center_cam("F", _ref_pose) - _group_center_cam("F", anchor_switch_pose)))
+            if _since >= ROT_UNCERTAIN_AFTER_SEC or _moved >= ROT_UNCERTAIN_MOVE_M:
+                rotation_uncertain_reason = (f"occluded {_since:.0f}s, arch moved {_moved*1000:.0f}mm "
+                                             f"while rotation is frozen")
+        elif holding:
+            rotation_uncertain_reason = "holding last good pose (lost)"
+        elif time.time() < rotation_uncertain_until:
+            rotation_uncertain_reason = rotation_uncertain_after_return
+
         # マーカー基準との差はログ書き込みの前に計算する（HUD 側はこの値を表示するだけ）
         if marker_ref is not None and marker_ref.is_registered():
             marker_err = marker_ref.error(pose)
         log_frame(frame_idx, f"{mode_text}[{'+'.join(fusion_keys) if fusion_active and fusion_keys else active_anchor}]",
                   last_quality, pose, quality_by_key, quality_raw,
-                  marker_err)
+                  marker_err, group_poses=group_poses_raw, event=frame_event,
+                  rot_uncertain=int(bool(rotation_uncertain_reason)))
         if diag_frame_dir is not None and frame_idx % DIAG_FRAME_DUMP_EVERY == 0:
             # ディスク書き込みはメインループから外す（数百 ms 固まる原因になり得る）
             threading.Thread(target=cv2.imwrite,
@@ -3284,6 +3544,7 @@ while True:
             pose_to_smooth = last_good_pose
         display_pose = smooth_pose(pose_to_smooth)
     else:
+        rotation_uncertain_reason = ""   # ADJUST 中は警告なし
         show = _HEADLESS_SHOW if HEADLESS else draw_dual_wireframe(frame_img, {a["key"]: pose for a in ANCHORS}, active_anchor)
         if marker_ref is not None:
             if not HEADLESS:
@@ -3343,6 +3604,7 @@ while True:
     _pf_mark("imshow")
     _pf_end()
 
+_grabber.stop()
 cap.release()
 log_file.close()
 if unity_udp_sock is not None:
