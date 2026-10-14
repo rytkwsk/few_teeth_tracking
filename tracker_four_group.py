@@ -203,7 +203,9 @@ FUSION_TRANS_SMOOTH       = 0.5    # 統合姿勢の並進の平滑化係数（1
 GROUP_DEPTH_FROM_REF      = True
 FUSION_F_RETURN_SEC       = 2.0    # F のスコアがこれだけ連続して回復閾値以上なら歯群の見え方によらず F へ復帰
 FUSION_NO_MEMBER_SEC      = 1.0    # 使える歯群がこれだけ無く F が OK 閾値以上なら F へ戻す
-ANCHOR_F_OK_QUALITY       = 0.45   # F の単体適合度がこれ以上なら F を出力（切替しない）
+ANCHOR_F_OK_QUALITY       = float(os.environ.get("M3T_F_OK_Q", "0.45"))   # F の単体適合度がこれ以上なら F を出力（切替しない）
+# ↑ 案 E（2026-10-14 13:00 run）: 統合中も追跡している F ボディ自身の誤差は qF 0.35〜0.45 で中央値 1.3〜1.4 mm / p90 ≤3.4 mm
+#   （ただし毎フレーム統合姿勢から 1 step した値なので、F 単独で何秒も粘れる証拠ではない）。M3T_F_OK_Q=0.38 で試して比較する。
 ANCHOR_F_RECOVER_QUALITY  = 0.55   # 歯群へ切替後、F がこれ以上に戻ったら F へ復帰（0.45 で復帰すると往復した）
 ANCHOR_GROUP_MIN_QUALITY = 0.60   # 0.55→0.60 (2026-10-01)。副アンカーへ切り替える最低適合度
 ANCHOR_SWITCH_MAX_ROT_DEG = 15.0   # 20→15 (2026-10-01: 歯群 D が切替後 0.5 s で 63 mm ずれた)
@@ -227,7 +229,11 @@ GROUP_ROTATION_FROM_F     = True
 # 統合中は回転を F 離脱時のまま固定するため、遮蔽中に模型が回ると F 復帰後も古い回転の局所解に落ちる
 # （ArUco 実測: 復帰後 11〜16° が残り、q は 0.56〜0.64 と「良好」に見えたまま）。復帰の瞬間だけ、歯列重心
 # まわりに回転した候補を M3T で数ステップ精密化し、剛体整合スコアが無回転より十分良いときだけ採用する。
-RETURN_ROT_SEARCH_ENABLED = os.environ.get("M3T_RETURN_SEARCH", "1") != "0"
+# 2026-10-14 12:45 run で既定を OFF にした: 採用判定が q 頼みのため、45.3 s の復帰で +21°（q 0.67→0.80）を採用して
+# 実際には 5.5°→31.8° に悪化、F はその局所解に q 0.91〜0.93 のまま 15 s 留まった（ArUco 32 mm / 44°）。108 s でも
+# 0.7°→13.4° に悪化。改善した例（90 s: 10.8°→0.8°）もあるが、safety-critical では「q が高い静かな誤り」を作る方が重い。
+# 遮蔽中の回転は統合中の回転追従（FUSION_ROT_*）で扱う。検証したいときは M3T_RETURN_SEARCH=1。
+RETURN_ROT_SEARCH_ENABLED = os.environ.get("M3T_RETURN_SEARCH", "0") != "0"
 RETURN_ROT_SEARCH_DEGS    = {"y": (6.0, 12.0, 18.0), "x": (8.0,), "z": (8.0,)}   # カメラ座標の軸ごとの候補角（±）。y=鉛直まわり（机上で回す）が主
 RETURN_ROT_SEARCH_STEPS   = 2      # 候補ごとの M3T 反復。3→2 (2026-10-09 14:42 run: 11 候補 × 3 step = 0.48 s が重い)
 RETURN_ROT_ACCEPT_MARGIN  = 0.03   # 無回転候補の剛体スコアよりこれ以上良いときだけ採用（q は 15° ずれても 0.6 出るので慎重に）
@@ -235,6 +241,41 @@ RETURN_ROT_ACCEPT_MARGIN  = 0.03   # 無回転候補の剛体スコアよりこ�
 # 約 7% の時間が停止になった。1〜2 s の短い離脱では回転はほぼ動かないので、長い遮蔽か大きな移動のときだけ走らせる。
 RETURN_ROT_SEARCH_MIN_OCCL_SEC = 1.5    # 離脱がこれ以上続いたときだけ再探索（1.0 では 14:42 run の 19 回全部が通り、1.0〜1.4 s の 7 回は補正 0°）
 RETURN_ROT_SEARCH_MIN_MOVE_M   = 0.006  # または離脱中に歯列重心がこれ以上動いたとき（回転で重心も動くため）
+# 2026-10-14 11:41 run: 再探索 12 回すべてが 1 フレーム 440〜470 ms の停止になっていた（「たまに起こるラグ」の正体）。
+# 候補を 1 フレームにまとめて評価せず、復帰時の画像を控えておいて毎フレーム数候補ずつ評価する（ライブ追跡は
+# その間も続く）。全候補が終わったら、採用候補の「基準姿勢からの回転（モデル座標）」を今の姿勢に掛けて適用する。
+RETURN_ROT_SEARCH_PER_FRAME    = int(os.environ.get("M3T_RETURN_SEARCH_PER_FRAME", "2"))   # 1 フレームに評価する候補数（1 候補 ≈ 36 ms）
+# ── 統合中の回転追従（2026-10-14）────────────────────────────────────────────
+# 統合モードは回転を F 離脱時のまま固定していたので、遮蔽中に模型を回すと追従しなかった。⑤ の実測で A（臼歯 3 本）の
+# 回転は遮蔽なしで F 並み（1.9° vs 2.5°）、統合中も 3.7° だったので、A（なければ B）の回転へ固定回転を少しずつ寄せる。
+# 歯群の回転は時々 20° 以上外れるため、(1) 採用は q が閾値以上かつ回転が安定（前フレームとの差が小さい）な状態が
+# 連続したときだけ、(2) 現在の回転との差が大き過ぎる歯群は誤適合として無視、(3) 1 フレームの変化量と離脱時からの
+# 累計に上限、(4) 歯群が統合から外れたら停止（回転はその時点で保持）。CSV の fus_rot_src / fus_rot_deg で確認できる。
+FUSION_ROT_FROM_GROUP     = os.environ.get("M3T_FUSION_ROT", "1") != "0"
+FUSION_ROT_SOURCE_KEYS    = ("A",)                  # 13:12 run で B を外した（偏り 11〜16°、B(cap) で走った）。D も使わない
+FUSION_ROT_PAIR_CHECK     = True    # 2 歯群以上のときだけ追従し、重心の並びの向き（画像上）で回転を検算する（13:12 run の暴走対策）
+FUSION_ROT_PAIR_MAX_DEG   = 8.0     # 予測と観測の向きの差がこれを超えたら追従を取り消して離脱時の回転へ戻す
+FUSION_ROT_MIN_QUALITY    = {"A": 0.60, "B": 0.65}  # 回転源として使う最低適合度（統合メンバーの条件 0.55 より厳しく）
+FUSION_ROT_EXIT_QUALITY   = {"A": 0.52, "B": 0.58}  # 追従中はこの値を割るまで続ける（開始 0.60/0.65 とのヒステリシス）
+FUSION_ROT_MIN_FRAMES     = 3       # 上の条件＋安定がこのフレーム数続いたら追従開始
+FUSION_ROT_MAX_JITTER_DEG = 4.0     # 歯群ボディの回転が前フレームからこれ以上変わったら「不安定」として連続カウントを戻す
+FUSION_ROT_MAX_DIFF_DEG   = 25.0    # 歯群の回転が現在の出力回転からこれ以上離れていたら誤適合とみなして無視
+FUSION_ROT_BLEND          = 0.25    # 1 フレームで残差のこの割合だけ寄せる（≈4 フレームで 1/e）
+FUSION_ROT_MAX_STEP_DEG   = 3.0     # 1 フレームの回転変化量の上限（2→3: 12:09 run で 1.6 s に 20° 回したとき追従が 10° 遅れた）
+FUSION_ROT_MAX_TOTAL_DEG  = 35.0    # 離脱時の回転からの累計上限（25→35: 12:09 run で実際に 30° 回して上限に当たった）
+# 歯群ボディの回転は F と系統的にずれる（2026-10-14 11:53 run: F が q 0.77 で安定していても A は出力から中央値 5.3°、
+# B 8.6° 離れた向きに収束する。メッシュと実物の差や 3 本歯の拘束の弱さによる偏り）。そのまま追従すると遮蔽のたびに
+# その偏りの分だけ回ってしまうので、F 追跡中に「歯群の回転 → 出力回転」の相対回転（モデル座標）を EMA で覚えておき、
+# 統合中はそれで補正した歯群の回転を追従先にする。
+FUSION_ROT_BIAS_COMP      = os.environ.get("M3T_FUSION_ROT_BIAS", "1") != "0"
+FUSION_ROT_BIAS_ALPHA     = 0.05    # 偏りの EMA 係数（≈20 フレーム ≈ 1 s の時定数）
+FUSION_ROT_BIAS_MIN_QF    = 0.60    # 偏りを学習するのは F がこの適合度以上で出力しているときだけ
+# マーカー基準が古い疑いの検知（2026-10-14: 10/09 の登録のまま測ったら全フレーム 15 mm / 17° の一定誤差だった。
+# ボードか模型が動いた＝物理的な関係が変わったのに、q は 0.6 台で見た目は普通に追えていた）。
+# F が良好に追跡しているのに誤差が大きい状態が続いたら、Unity パネルに登録し直しを促す。
+MARKER_STALE_ERR_MM       = 8.0
+MARKER_STALE_MIN_QF       = 0.60
+MARKER_STALE_SEC          = 3.0
 # ── ② 回転不確か警告 ────────────────────────────────────────────────────────
 # 統合中（回転固定）が長い／歯列が大きく動いた／HOLD 中は、出力の回転が古い可能性があることを Unity に伝える。
 ROT_UNCERTAIN_AFTER_SEC   = 2.0    # 統合（回転固定）がこれ以上続いたら警告
@@ -447,6 +488,56 @@ RELOCK_MAX_TRANS_M        = 0.020   # guard=on の再ロックで、基準姿勢
 # guard=on の再ロックが失敗しても、ロストがこの秒数続くまでは全探索・並進探索へ上げない（遮蔽が続いている間に
 # 範囲を広げると、見えている別の歯や台座に合ってしまう）。
 RELOCK_ESCALATE_AFTER_SEC = 5.0
+# ── ① HOLD 中の惰性追跡（2026-10-14）────────────────────────────────────────
+# 12:09 run のロスト 14 回はすべて「手で模型を持って動かす → 歯群が 2〜3 個同時に隠れる → 剛体スコア < 0.40 → HOLD」
+# で、HOLD は毎フレーム last_good_pose に戻す（姿勢の凍結）ため、模型が動き続けると収束範囲（1〜2 cm）を外れて
+# 全探索（SNAP）に落ちていた。真の移動速度は 6〜14 mm/s と遅く、遮蔽なしの F は 2〜12 mm/s で追従比 ≈1.0（遅れなし）。
+# → q が落ちた瞬間に模型が動いていた（直前の出力速度 ≥ COAST_MIN_SPEED）なら、COAST_MAX_SEC の間は last_good に戻さず
+#   「直前の速度で 1 フレーム先を予測した姿勢」から M3T を進め続ける（惰性追跡）。暴走は跳び量ゲートと
+#   HOLD_BEFORE_RECOVERY_SEC 後の再ロックで止める。静止中の遮蔽（速度ほぼ 0）は従来どおり凍結する。
+COAST_ENABLED               = os.environ.get("M3T_COAST", "1") != "0"
+COAST_MIN_SPEED_M_PER_FRAME = 0.00025  # 0.25 mm/フレーム ≈ 6 mm/s @24 fps。これ未満なら「静止中の遮蔽」とみなして凍結
+COAST_MAX_SEC               = 1.5      # 惰性で追う最長時間（これを過ぎたら従来の HOLD → 再ロック）
+COAST_VEL_ALPHA             = 0.3      # 出力速度の EMA 係数
+COAST_VEL_DECAY             = 0.92     # 惰性中は毎フレーム速度を減衰（予測が飛び続けないように）
+COAST_VEL_MAX_M             = 0.010    # 1 フレームにこれ以上動いた出力は「跳び」なので速度に入れない
+# ── ② ロスト判定スコア（2026-10-14）──────────────────────────────────────────
+# 従来は A/B/C の単純平均。1 歯群が手で隠れただけで 0.40 を割って HOLD に落ちていた。"top2" では A/B/C/D の上位 2 つの
+# 平均も計算し、大きい方を HOLD 判定に使う（遮蔽に強い）。既知のリスク（上のコメント）: A が完全に外れていても B/C で
+# 0.54 になる誤適合を見逃しやすい。last_good_pose の更新・再ロックの合否・復帰時再探索は従来の厳しいスコアのまま。
+# ArUco で「q ≥ 0.4 なのに誤差 > 5 mm」が増えないか確認して既定を決める。"abc3" で従来動作。
+# ── 案 A: 単独歯群の統合を禁止（2026-10-14 12:45 run）────────────────────────
+# 統合中の大きなずれ（回転 15° 超 75 フレーム、並進 p90 20 mm）はほぼ B 単独統合。B は奥行き 6.5〜8 mm の偏りと
+# 回転 10° 超の履歴がある。「A を含む」か「2 歯群以上」のときだけ統合し、B/D だけなら保持（＋等速予測）にする。
+FUSION_REQUIRE_A_OR_PAIR = os.environ.get("M3T_FUSION_SOLO", "0") != "1"   # M3T_FUSION_SOLO=1 で従来（単独でも統合）
+# ── 案 B: 等速予測（2026-10-14）────────────────────────────────────────────────
+# 出力速度（惰性追跡と同じ EMA）で 1 フレーム先を予測した姿勢から M3T を進める。統合中は常に、F 追跡中は
+# PREDICT_F_MIN_SPEED_M 以上で動いているときだけ（静止時にノイズを足さない）。12:45 run で 24〜48 mm/s の
+# F 誤差が 4.0 mm / 3.6°（〜24 mm/s では 1.5 mm / 0.7°）だったのを縮める狙い。
+PREDICT_ENABLED           = os.environ.get("M3T_PREDICT", "1") != "0"
+PREDICT_F_MIN_SPEED_M     = 0.0005  # 0.5 mm/フレーム ≈ 12 mm/s
+FUSION_HOLD_PREDICT_MAX_SEC = 1.0   # 使える歯群がない間、保持姿勢を速度で進める最長時間（速度は毎フレーム減衰）
+# ── 歯でない場所への誤ロック検知（2026-10-14 13:00 run）────────────────────────
+# 手で隠しながら動かした後、F が台座の白黒模様＋スタンドの縁に合い、q 0.72〜0.93 のまま 13 s 外れ続けた（ArUco 68 mm / 35°）。
+# 剛体スコアは厳格版でも 0.66 を保ち、q 系の指標では捕まらない。歯色マスク（ALIGN_WHITE_*、並進探索の採点に既存）に
+# F モデルの内部点が乗っている割合は、正しい追跡で 0.42〜0.81（中央値 0.68〜0.77）、この誤ロックで 0.13〜0.19 と分かれる。
+# F 追跡中（統合でない）に q が良好なのにこの割合が低い状態が続いたら、誤ロックとみなして並進探索の再ロックへ落とす。
+# 遮蔽中（統合）は手が歯を覆って割合が 0.07 まで落ちるので判定しない。歯の上でずれる誤ロック（12:45 run の 31 mm、割合 0.62）は捕まらない。
+NONTOOTH_CHECK_ENABLED   = os.environ.get("M3T_NONTOOTH_CHECK", "1") != "0"
+NONTOOTH_FILL_MIN        = 0.30    # 歯色マスクに乗っている内部点の割合（EMA）がこれ未満で
+NONTOOTH_SEC             = 1.0     # この秒数続いたら誤ロック（13:12 run: 統合で 1 s ごとに中断されタイマーが戻って発火しなかった →
+                                   #   統合中はタイマーを止めるだけでリセットしない。1.5→1.0 s）
+NONTOOTH_FILL_SEVERE     = 0.20    # これ未満なら NONTOOTH_SEVERE_SEC で即判定（13:12 run の誤ロックは 0.13〜0.17）
+NONTOOTH_SEVERE_SEC      = 0.5
+# 奥行きの窓: 追跡開始後、最初に良好になった姿勢の奥行きを基準に、この比率の外へ出た姿勢は跳び量ゲートで拒否する
+DEPTH_WINDOW_MIN_RATIO   = 0.65
+DEPTH_WINDOW_MAX_RATIO   = 1.5
+NONTOOTH_MIN_QUALITY     = 0.46    # 判定するのは q がこれ以上（追跡できているつもり）のときだけ
+NONTOOTH_EVAL_EVERY      = 2       # 評価間隔（フレーム）。歯色マスクは 720p で 3〜4 ms
+NONTOOTH_FILL_EMA_ALPHA  = 0.3
+LOST_SCORE_MODE          = os.environ.get("M3T_LOST_SCORE", "top2")
+LOST_SCORE_LENIENT_KEYS  = ("A", "B", "C", "D")
+LOST_SCORE_LENIENT_TOP_K = 2
 
 # 良い品質が続いた姿勢を自動でスロットに登録する機能。患者の頭や模型の向きが
 # 変わるたびにクリック初期化をやり直す手間を減らすため、追跡中に安定して
@@ -1075,6 +1166,72 @@ def return_rotation_search(frame_bgr, dist_map, base_pose):
     return chosen[3], delta, base_q, chosen[0], dt
 
 
+def _slerp_R(Ra, Rb, alpha):
+    """回転 Ra から Rb へ割合 alpha だけ進めた回転（軸角で補間）。"""
+    rv, _ = cv2.Rodrigues(np.asarray(Rb, np.float64) @ np.asarray(Ra, np.float64).T)
+    Rd, _ = cv2.Rodrigues(rv * float(alpha))
+    return Rd @ np.asarray(Ra, np.float64)
+
+
+def _rotate_pose_about_point(pose_mat, Rd, c_cam):
+    """カメラ座標の点 c_cam を中心に、カメラ座標の回転 Rd を掛けた姿勢を返す。"""
+    R, t = pose_mat[:3, :3], pose_mat[:3, 3]
+    out = pose_mat.copy().astype(np.float32)
+    out[:3, :3] = (Rd @ R).astype(np.float32)
+    out[:3, 3] = (Rd @ (t - c_cam) + c_cam).astype(np.float32)
+    return out
+
+
+def return_search_begin(frame_bgr, dist_map, base_pose, occl_text):
+    """① 復帰時回転再探索の分割版: 復帰時の画像と候補を控えるだけで、この場では評価しない。
+    毎フレーム return_search_advance() が RETURN_ROT_SEARCH_PER_FRAME 候補ずつ評価する。"""
+    cands = [("none", 0.0, base_pose.copy().astype(np.float32))]
+    for axis, degs in RETURN_ROT_SEARCH_DEGS.items():
+        for d in degs:
+            for s in (1.0, -1.0):
+                cands.append((axis, s * d, _rotate_pose_about_arch_center(base_pose, axis, s * d)))
+    return {"frame_rgb": cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), "dist_map": dist_map,
+            "base_pose": base_pose.copy().astype(np.float32), "cands": cands, "results": [],
+            "t0": time.perf_counter(), "busy_ms": 0.0, "occl_text": occl_text}
+
+
+def return_search_advance(job):
+    """控えた画像に対して候補を数個評価する。ライブ追跡のボディ姿勢は呼ぶ前の状態に戻してから返す。
+    全候補が終わったら (採用姿勢の base からの相対変換[モデル座標] or None, 採用回転量[deg], 無回転 q, 採用 q, 経過秒, 計算時間秒)
+    を返し、未完なら None を返す。"""
+    t0 = time.perf_counter()
+    saved = {a["key"]: a["model"].pose_cv.copy() for a in ANCHORS}
+    n_done = len(job["results"])
+    for axis, d, cand in job["cands"][n_done:n_done + max(1, RETURN_ROT_SEARCH_PER_FRAME)]:
+        reset_all_anchors(cand)
+        for _ in range(RETURN_ROT_SEARCH_STEPS):
+            tracker.step(job["frame_rgb"])
+        refined = ANCHOR_BY_KEY["F"]["model"].pose_cv.copy().astype(np.float32)
+        job["results"].append((estimate_rigid_quality(job["dist_map"], refined), axis, d, refined))
+    for a in ANCHORS:
+        a["model"].reset_pose_cv(saved[a["key"]])
+    job["busy_ms"] += (time.perf_counter() - t0) * 1000.0
+    if len(job["results"]) < len(job["cands"]):
+        return None
+    results = job["results"]
+    base_q = results[0][0]
+    best = max(results, key=lambda r: r[0])
+    chosen = best if best[0] >= base_q + RETURN_ROT_ACCEPT_MARGIN else results[0]
+    delta = rotation_angle_deg(chosen[3], job["base_pose"])
+    elapsed = time.perf_counter() - job["t0"]
+    top = sorted(results, key=lambda r: -r[0])[:4]
+    print(f"復帰時回転再探索: 無回転 q={base_q:.2f} → 採用 {chosen[1]}{chosen[2]:+.0f}° q={chosen[0]:.2f} "
+          f"(base からの回転 {delta:.1f}°, {len(results)} 候補を {elapsed*1000:.0f} ms に分割, 計算 {job['busy_ms']:.0f} ms)  上位: "
+          + ", ".join(f"{a}{d:+.0f}°={q:.2f}" for q, a, d, _ in top))
+    # 採用候補を「基準姿勢からの相対変換（モデル座標）」にして返す。評価中もライブ追跡は進んでいるので、
+    # 候補姿勢そのものではなく、この相対変換を今の姿勢に掛けて適用する。
+    rel = None
+    if chosen is not results[0]:
+        base = job["base_pose"].astype(np.float64)
+        rel = (np.linalg.inv(base) @ chosen[3].astype(np.float64)).astype(np.float32)
+    return rel, delta, base_q, chosen[0], elapsed, job["busy_ms"] / 1000.0
+
+
 def reset_all_anchors(pose_mat):
     for a in ANCHORS:
         a["model"].reset_pose_cv(pose_mat)
@@ -1619,17 +1776,29 @@ def estimate_search_quality(dist_map, candidate_pose, max_dist, tooth_mask):
     return float(np.sqrt(edge_q * estimate_color_quality(tooth_mask, candidate_pose)))
 
 
-def estimate_rigid_quality(dist_map, candidate_pose, keys=None):
+def estimate_rigid_quality(dist_map, candidate_pose, keys=None, top_k=None):
     """剛体整合スコア: 同じ候補姿勢を RIGID_QUALITY_KEYS の各アンカーのジオメトリで
     評価し、上位 RIGID_QUALITY_TOP_K の平均を返す。
     アンカー単体の最大値だと、3本歯のアンカーが歯列の別の歯に乗っただけで 1.0 に
     なり「4グループが同一剛体である」という制約を全く見ないため、ロスト/良好判定と
     自動姿勢選択の採点にはこちらを使う。"""
     keys = keys or RIGID_QUALITY_KEYS
+    top_k = top_k or RIGID_QUALITY_TOP_K
     qs = sorted((estimate_anchor_quality(dist_map, candidate_pose, ANCHOR_BY_KEY[k]) for k in keys),
                 reverse=True)
-    top = qs[:max(1, min(RIGID_QUALITY_TOP_K, len(qs)))]
+    top = qs[:max(1, min(top_k, len(qs)))]
     return float(np.mean(top))
+
+
+def _predict_pose_by_velocity(pose_mat, vel_t, vel_rv):
+    """① 出力速度で 1 フレーム先の姿勢を予測する（回転は歯列重心まわり、並進はカメラ座標）。"""
+    out = pose_mat.copy().astype(np.float32)
+    ang = float(np.linalg.norm(vel_rv))
+    if ang > 1e-6:
+        Rd, _ = cv2.Rodrigues(np.asarray(vel_rv, np.float64))
+        out = _rotate_pose_about_point(out, Rd, _group_center_cam("F", out))
+    out[:3, 3] += np.asarray(vel_t, np.float32)
+    return out
 
 
 def estimate_combined_quality(dist_map, candidate_pose):
@@ -2178,6 +2347,28 @@ rotation_uncertain_after_return = ""   # ② 復帰時の警告文
 rotation_uncertain_reason = ""         # ② 今フレームの警告理由（空 = 警告なし）。Unity へ送る
 frame_event = ""                       # CSV の event 列（復帰時回転再探索の結果など、そのフレームの特記事項）
 group_poses_raw = None                 # ⑤ M3T ステップ直後の各歯群ボディの姿勢（統合で上書きされる前のもの）
+return_search_job = None               # ① 分割実行中の復帰時回転再探索（None = なし）。return_search_begin/advance 参照
+fusion_rot_ref = None                  # 統合中の基準姿勢（回転 = 現在の出力回転、F 重心は離脱時の位置）。_fuse_groups の ref
+fusion_rot_src = ""                    # いま回転を追従している歯群（"" = 固定）
+fusion_rot_total_deg = 0.0             # 離脱時の回転からの累計回転量
+fusion_rot_streak = {}                 # 歯群ごとの「回転源の条件を満たした連続フレーム数」
+fusion_rot_prev_R = {}                 # 歯群ごとの前フレームの回転（安定判定用）
+fusion_rot_bias = {}                   # 歯群ごとの「歯群ボディの回転 → 出力回転」相対回転（モデル座標 3x3、F 追跡中に EMA 学習）
+marker_stale_since = None              # マーカー基準が古い疑い（F 良好なのに誤差大）が続き始めた時刻
+marker_stale_warned = False
+pose_vel_t = np.zeros(3)               # ① 出力姿勢の並進速度 [m/フレーム]（EMA）
+pose_vel_rv = np.zeros(3)              # ① 出力姿勢の回転速度（回転ベクトル [rad/フレーム]、EMA）
+coast_until = 0.0                      # ① この時刻までは HOLD で凍結せず惰性で追う
+coast_decided = False                  # ① 今回の HOLD で惰性にするか判定済みか（HOLD に入った瞬間に 1 回だけ決める）
+coasting = False                       # ① 今フレーム惰性追跡中か（統合の「使える歯群なし」分岐が参照）
+fusion_solo_blocked = ""               # 案 A: 単独のため統合から外している歯群（ログ用）
+nontooth_fill_ema = None               # 歯色マスクに乗っている F 内部点の割合（EMA）。F 追跡中だけ更新
+nontooth_since = None                  # 割合が NONTOOTH_FILL_MIN を割り続け始めた時刻
+nontooth_reason = ""                   # 今フレームの警告文（Unity バナー用）
+nontooth_low_sec = 0.0                 # 割合が低かった累積秒数（統合中は加算せず、F に戻ったら続きから）
+nontooth_last_t = None
+session_depth_ref = None               # 追跡開始後に最初に良好になった姿勢の奥行き [m]（奥行き窓の基準）
+depth_window_hit = False
 pose_jump_rejects = 0        # ゲートで捨てた回数（ログ用）
 relock_fail_count = 0        # 自動再ロックの連続失敗回数（エスカレーション用）
 _auto_select_info = {"quality": 0.0}   # pose_auto_select が最後に選んだ候補の品質
@@ -2302,7 +2493,9 @@ def send_pose_to_unity(pose_mat, mode_text):
     payload = json.dumps({
         "name": ANCHOR_BY_KEY[active_anchor]["name"],
         "active_anchor": unity_anchor,
-        "pose_anchor": ("+".join(fusion_keys) if fusion_active and fusion_keys else active_anchor),
+        # 統合で F を離れたが使える歯群がない（保持/予測）間は "hold"（以前は "F" と出ていた）
+        "pose_anchor": ("+".join(fusion_keys) if fusion_active and fusion_keys
+                        else ("hold" if fusion_off_f else active_anchor)),
         "quality": [round(float(last_anchor_quality.get(k, 0.0)), 3) for k in ("F", "A", "B", "C", "D")],
         "timestamp": time.time(),
         "mode": mode_text,
@@ -2640,6 +2833,13 @@ log_writer.writerow([
     "gF_rot_deg",             # F ボディ（統合中は統合姿勢＝固定回転）の回転差
     "event",                  # 特記事項（復帰時回転再探索の結果など）
     "rot_uncertain",          # ② 「回転不確か」警告が出ていたフレームは 1
+    # 歯群ボディ自身の回転と出力回転の差（マーカーなしでも取れる）。F 追跡中は「歯群の回転が F とどれだけ合うか」、
+    # 統合中は「追従先の歯群と出力の残差」になる
+    "gA_vs_out_deg", "gB_vs_out_deg", "gD_vs_out_deg",
+    "fus_rot_src",            # 統合中に回転を追従している歯群（空 = 固定 / 統合でない）。"(cap)" 付きは累計上限で停止
+    "fus_rot_deg",            # 統合中の、離脱時の回転からの累計回転量 [deg]
+    "gF_cen_mm",              # 案 E 用: F ボディ自身（統合中も追跡している生の姿勢）の歯列重心の 3D 誤差 [mm]。qF と組で見る
+    "fill_q",                 # 歯色マスクに乗っている F 内部点の割合（EMA、F 追跡中のみ）。誤ロック検知のしきい値調整用
 ])
 
 diag_frame_dir = None
@@ -2649,10 +2849,19 @@ if DIAG_FRAME_DUMP_EVERY > 0:
 
 
 def log_frame(frame_idx, mode_text, quality, pose_mat, quality_by_key=None, quality_raw_value=float("nan"),
-              marker_err=None, group_poses=None, event="", rot_uncertain=0):
+              marker_err=None, group_poses=None, event="", rot_uncertain=0, fus_rot_src="", fus_rot_deg=None,
+              fill_q=None):
     R, t = pose_mat[:3, :3], pose_mat[:3, 3]
     qk = quality_by_key or {}
     gcols = [""] * 10
+    vs_out = [""] * 3
+    gF_cen = ""
+    if group_poses:
+        vs_out = [f"{rotation_angle_deg(group_poses[k], pose_mat):.3f}" if group_poses.get(k) is not None else ""
+                  for k in ("A", "B", "D")]
+        if marker_err is not None and group_poses.get("F") is not None:
+            _P = marker_err["predicted"]
+            gF_cen = f"{float(np.linalg.norm(_group_center_cam('F', group_poses['F']) - _group_center_cam('F', _P))) * 1000.0:.3f}"
     if marker_err is not None:
         P = marker_err["predicted"]
         rv, _ = cv2.Rodrigues(P[:3, :3].astype(np.float64))
@@ -2693,6 +2902,11 @@ def log_frame(frame_idx, mode_text, quality, pose_mat, quality_by_key=None, qual
         *gcols,
         event,
         rot_uncertain,
+        *vs_out,
+        fus_rot_src,
+        "" if fus_rot_deg is None else f"{fus_rot_deg:.3f}",
+        gF_cen,
+        "" if fill_q is None else f"{fill_q:.3f}",
     ])
 
 
@@ -2997,6 +3211,19 @@ while True:
     if tracking_active:
         frame_rgb = cv2.cvtColor(frame_img, cv2.COLOR_BGR2RGB)
 
+        # ① 分割実行中の復帰時回転再探索: ライブの step の前に、控えた画像で候補を数個だけ評価する
+        return_search_result = None
+        return_search_result_text = ""
+        if return_search_job is not None:
+            if snap_frames > 0:
+                return_search_job = None   # 再ロック中は意味がない
+            else:
+                return_search_result = return_search_advance(return_search_job)
+                if return_search_result is not None:
+                    return_search_result_text = return_search_job["occl_text"]
+                    return_search_job = None
+        _pf_mark("return_search")
+
         if snap_frames > 0:
             for _ in range(SNAP_FRAME_STEPS):
                 tracker.step(frame_rgb)
@@ -3014,12 +3241,27 @@ while True:
         # active_anchor の pose に全アンカーを同期する（後段で reset_all_anchors）。
         _pf_mark("m3t_step")
         poses_by_key = {a["key"]: a["model"].pose_cv.copy().astype(np.float32) for a in ANCHORS}
+        if return_search_result is not None:
+            # ① 再探索の全候補が終わった: 採用候補の相対回転（モデル座標）を今の F 姿勢に掛けて適用する
+            _rel, _rdeg, _q0, _q1, _rel_sec, _busy_sec = return_search_result
+            if _rel is not None:
+                _rp = (poses_by_key["F"].astype(np.float64) @ _rel.astype(np.float64)).astype(np.float32)
+                reset_all_anchors(_rp)
+                poses_by_key = {k: _rp.copy() for k in poses_by_key}
+                prev_output_pose = None   # 再探索先を跳び量ゲートが「跳び」として戻さないように
+                if _rdeg >= 3.0:
+                    rotation_uncertain_until = time.time() + ROT_UNCERTAIN_AFTER_RETURN_SEC
+                    rotation_uncertain_after_return = f"rotation corrected by {_rdeg:.0f} deg on return - verify alignment"
+            frame_event = (f"return_search:{_rdeg:.1f}deg q{_q0:.2f}->{_q1:.2f} "
+                           f"{_rel_sec*1000:.0f}ms(busy {_busy_sec*1000:.0f}ms) {return_search_result_text}")
         # ⑤ 各歯群ボディ自身の推定（回転込み）。この後の統合／同期で poses_by_key は出力姿勢に上書きされるので、
         # ログ用にここで控えておく（14:34 run で A/B/D の回転誤差が全部 F と同じ値になっていた原因）。
         group_poses_raw = {k: p.copy() for k, p in poses_by_key.items()}
         pose = poses_by_key[active_anchor]
         quality_by_key = {}  # SNAPウォームアップ中は未評価（HUD表示は0.0のまま）
         if snap_frames > 0:
+            if relock_reason != "auto":
+                session_depth_ref = None   # 手動の開始／スロット再ロックは配置が変わった可能性があるので奥行き基準を取り直す
             fusion_active = False
             fusion_keys = []
             fusion_off_f = False
@@ -3144,6 +3386,15 @@ while True:
                 qF_ = quality_by_key.get("F", 0.0)
                 now_t = time.time()
                 if not fusion_off_f:
+                    # F が良好に出力している間に、歯群ボディの回転が出力回転からどちらへ偏るかを覚える（統合中の追従先の補正用）
+                    if FUSION_ROT_FROM_GROUP and FUSION_ROT_BIAS_COMP and qF_ >= FUSION_ROT_BIAS_MIN_QF and group_poses_raw:
+                        R_out = poses_by_key["F"][:3, :3].astype(np.float64)
+                        for k in FUSION_ROT_SOURCE_KEYS:
+                            if quality_by_key.get(k, 0.0) < FUSION_ROT_MIN_QUALITY.get(k, 0.6):
+                                continue
+                            rel = group_poses_raw[k][:3, :3].astype(np.float64).T @ R_out   # モデル座標: 歯群回転 → 出力回転
+                            prev = fusion_rot_bias.get(k)
+                            fusion_rot_bias[k] = rel if prev is None else _slerp_R(prev, rel, FUSION_ROT_BIAS_ALPHA)
                     # F で追跡中。F が落ちたら F を離れ、出力を最後の良好姿勢へ戻す（HOLD と同じ扱い。
                     # 遮蔽で流れた F 姿勢と last_good の差を跳び量ゲートに拒否させないため prev_output_pose を外す）。
                     if qF_ < ANCHOR_F_OK_QUALITY and last_good_pose is not None and now_t >= group_block_until:
@@ -3156,7 +3407,16 @@ while True:
                         fusion_f_ok_since = None
                         fusion_no_member_since = None
                         prev_output_pose = None
-                        print(f"統合: F を離脱 (F={qF_:.2f})")
+                        # 回転追従の基準は離脱時の姿勢から（回転は固定スタート、F 重心の位置もここが基準）
+                        fusion_rot_ref = last_good_pose.copy()
+                        fusion_rot_src = ""
+                        fusion_rot_total_deg = 0.0
+                        fusion_rot_streak = {}
+                        fusion_rot_prev_R = {}
+                        return_search_job = None   # 評価途中の再探索があれば捨てる（復帰前の画像なので意味がない）
+                        _bias_text = ", ".join(f"{k}:{np.rad2deg(np.linalg.norm(cv2.Rodrigues(fusion_rot_bias[k])[0])):.1f}°"
+                                               for k in FUSION_ROT_SOURCE_KEYS if k in fusion_rot_bias)
+                        print(f"統合: F を離脱 (F={qF_:.2f})" + (f"  回転偏り補正: {_bias_text}" if _bias_text else ""))
                 else:
                     fusion_f_ok_since = (fusion_f_ok_since or now_t) if qF_ >= ANCHOR_F_RECOVER_QUALITY else None
                     all_visible = all(quality_by_key.get(k, 0.0) >= FUSION_GROUP_EXIT_QUALITY for k in FUSION_KEYS)
@@ -3192,16 +3452,14 @@ while True:
                             rotation_uncertain_after_return = (f"F resumed after {_occl_sec:.0f}s occlusion "
                                                                f"({_occl_moved*1000:.0f}mm moved) - verify alignment")
                         # ① 回転が古い疑いがあるときだけ、固定していた回転の周りを再探索して古い局所解から抜ける
-                        _occl_text = f"occl{_occl_sec:.1f}s/{_occl_moved*1000:.0f}mm"
+                        _occl_text = (f"occl{_occl_sec:.1f}s/{_occl_moved*1000:.0f}mm"
+                                      + (f"/rot{fusion_rot_total_deg:.0f}deg({fusion_rot_src or '-'})" if FUSION_ROT_FROM_GROUP else ""))
+                        fusion_rot_ref = None
+                        fusion_rot_src = ""
                         if _do_search:
-                            _rp, _rdeg, _q0, _q1, _rdt = return_rotation_search(frame_img, dist_map, poses_by_key["F"])
-                            poses_by_key = {k: _rp for k in poses_by_key}
-                            pose = _rp
-                            prev_output_pose = None   # 再探索先を跳び量ゲートが「跳び」として戻さないように
-                            frame_event = f"return_search:{_rdeg:.1f}deg q{_q0:.2f}->{_q1:.2f} {_rdt*1000:.0f}ms {_occl_text}"
-                            if _rdeg >= 3.0:
-                                rotation_uncertain_until = now_t + ROT_UNCERTAIN_AFTER_RETURN_SEC
-                                rotation_uncertain_after_return = f"rotation corrected by {_rdeg:.0f} deg on return - verify alignment"
+                            # ① 候補はこの場では評価しない（1 フレーム 450 ms 止まる）。画像を控えて次フレームから分割評価する
+                            return_search_job = return_search_begin(frame_img, dist_map, poses_by_key["F"], _occl_text)
+                            frame_event = f"return_search_begin {len(return_search_job['cands'])}cands {_occl_text}"
                         else:
                             frame_event = f"return_no_search {_occl_text}"
                 if fusion_off_f:
@@ -3226,9 +3484,84 @@ while True:
                             fusion_enter_streak[k] = 0
                     fusion_members = new_members
                     sane = sorted(fusion_members)
+                    # 案 A: B/D 単独では統合しない（A を含むか 2 歯群以上が条件）
+                    if FUSION_REQUIRE_A_OR_PAIR and sane and "A" not in sane and len(sane) < 2:
+                        if fusion_solo_blocked != sane[0]:
+                            print(f"統合: {sane[0]} 単独は使わない (q={quality_by_key.get(sane[0], 0):.2f}) → 保持")
+                        fusion_solo_blocked = sane[0]
+                        dropped.append(f"{sane[0]}:solo")
+                        sane = []
+                    elif sane:
+                        fusion_solo_blocked = ""   # 使える構成になったらリセット（メンバーなしの間は保持して連続表示を防ぐ）
+                    # ── 統合中の回転追従: 条件を満たす歯群（A 優先、次に B）の回転へ固定回転を少しずつ寄せる ──
+                    if fusion_rot_ref is None:
+                        fusion_rot_ref = anchor_switch_pose.copy()
+                    rot_src_now = ""
+                    # 2 歯群以上が見えているときだけ回転を追従し、回転源の回転が「2 歯群の重心を結ぶ向き（画像上）」と
+                    # 矛盾したら追従を止めて離脱時の回転へ戻す（13:12 run: A 単独の回転が間違ったまま毎フレーム積み上がり、
+                    # 35° 近くまで走って統合出力が 45 mm ずれた。重心位置は信頼できるので、その並びの向きで回転を検算する）
+                    rot_pair_ok = len(sane) >= 2
+                    if rot_pair_ok and FUSION_ROT_PAIR_CHECK:
+                        _k0, _k1 = sane[0], sane[-1]
+                        _obs = [_group_center_cam(k, poses_by_key[k]) for k in (_k0, _k1)]
+                        _prd = [_group_center_cam(k, fusion_rot_ref) for k in (_k0, _k1)]
+                        def _dir2d(p0, p1):
+                            v = np.array([p1[0] / p1[2] - p0[0] / p0[2], p1[1] / p1[2] - p0[1] / p0[2]])
+                            n = float(np.linalg.norm(v))
+                            return v / n if n > 1e-9 else None
+                        _do, _dp = _dir2d(*_obs), _dir2d(*_prd)
+                        if _do is not None and _dp is not None:
+                            _pair_deg = float(np.degrees(np.arccos(np.clip(np.dot(_do, _dp), -1.0, 1.0))))
+                            if _pair_deg > FUSION_ROT_PAIR_MAX_DEG:
+                                rot_pair_ok = False
+                                if fusion_rot_total_deg > 0.5:
+                                    print(f"統合: 回転追従を取り消し（{_k0}-{_k1} 重心の向きが現在の回転と {_pair_deg:.0f}° 矛盾、"
+                                          f"累計 {fusion_rot_total_deg:.1f}° → 離脱時の回転へ戻す）")
+                                    fusion_rot_ref = anchor_switch_pose.copy()
+                                    fusion_rot_total_deg = 0.0
+                                    fusion_rot_streak = {}
+                    if FUSION_ROT_FROM_GROUP and rot_pair_ok:
+                        for k in FUSION_ROT_SOURCE_KEYS:
+                            prev_pk = fusion_rot_prev_R.get(k)
+                            jitter = rotation_angle_deg(poses_by_key[k], prev_pk) if prev_pk is not None else 0.0
+                            fusion_rot_prev_R[k] = poses_by_key[k].copy()
+                            diff = rotation_angle_deg(poses_by_key[k], fusion_rot_ref)
+                            # ヒステリシス: 追従中の歯群は q が EXIT 閾値を割るまで続ける（12:09 run で A の q が 0.60 前後を
+                            # 行き来して 固定→A→固定 が数フレームごとに切り替わり、追従が細切れになった）
+                            following = fusion_rot_src.split("(")[0] == k
+                            q_min = FUSION_ROT_EXIT_QUALITY.get(k, 0.55) if following else FUSION_ROT_MIN_QUALITY.get(k, 0.6)
+                            ok = (k in fusion_members
+                                  and quality_by_key.get(k, 0.0) >= q_min
+                                  and jitter <= FUSION_ROT_MAX_JITTER_DEG
+                                  and diff <= FUSION_ROT_MAX_DIFF_DEG)
+                            fusion_rot_streak[k] = fusion_rot_streak.get(k, 0) + 1 if ok else 0
+                            if not rot_src_now and ok and (following or fusion_rot_streak[k] >= FUSION_ROT_MIN_FRAMES):
+                                rot_src_now = k
+                        if rot_src_now:
+                            R_cur = fusion_rot_ref[:3, :3].astype(np.float64)
+                            R_src = poses_by_key[rot_src_now][:3, :3].astype(np.float64)
+                            if FUSION_ROT_BIAS_COMP and rot_src_now in fusion_rot_bias:
+                                R_src = R_src @ fusion_rot_bias[rot_src_now]   # 歯群の系統的な偏りを除いた「F 相当」の回転
+                            rv, _ = cv2.Rodrigues(R_src @ R_cur.T)
+                            ang = float(np.rad2deg(np.linalg.norm(rv)))
+                            if ang > 1e-3:
+                                step_deg = min(ang * FUSION_ROT_BLEND, FUSION_ROT_MAX_STEP_DEG)
+                                Rd, _ = cv2.Rodrigues(rv / np.linalg.norm(rv) * np.deg2rad(step_deg))
+                                cand_ref = _rotate_pose_about_point(fusion_rot_ref, Rd, _group_center_cam("F", fusion_rot_ref))
+                                total = rotation_angle_deg(cand_ref, anchor_switch_pose)
+                                if total <= FUSION_ROT_MAX_TOTAL_DEG:
+                                    fusion_rot_ref = cand_ref
+                                    fusion_rot_total_deg = total
+                                else:
+                                    rot_src_now = f"{rot_src_now}(cap)"   # 累計上限: これ以上は寄せない（回転は保持）
+                        if rot_src_now != fusion_rot_src:
+                            print(f"統合: 回転源 {fusion_rot_src or '固定'} → {rot_src_now or '固定'} "
+                                  f"(累計 {fusion_rot_total_deg:.1f}°, " + ", ".join(f"{k}:q={quality_by_key.get(k, 0):.2f}"
+                                                                              for k in FUSION_ROT_SOURCE_KEYS) + ")")
+                    fusion_rot_src = rot_src_now
                     if sane:
                         fusion_no_member_since = None
-                        fused = _fuse_groups(sane, poses_by_key, anchor_switch_pose)
+                        fused = _fuse_groups(sane, poses_by_key, fusion_rot_ref)
                         cF = ANCHOR_BY_KEY["F"]["centroid"]
                         drift_m = float(np.linalg.norm((fused[:3, :3] @ cF + fused[:3, 3])
                                                        - (anchor_switch_pose[:3, :3] @ cF + anchor_switch_pose[:3, 3])))
@@ -3262,11 +3595,22 @@ while True:
                         if fusion_no_member_since is None:
                             fusion_no_member_since = now_t
                         if fusion_active:
-                            print("統合: 使える歯群なし → 直前姿勢を保持"
+                            print("統合: 使える歯群なし → " + ("惰性追跡中なので F の生姿勢を通す" if coasting else "直前姿勢を保持")
                                   + (f" (除外 {' '.join(dropped)})" if dropped else ""))
                         fusion_active = False
                         fusion_keys = []
-                        poses_by_key["F"] = fusion_hold_pose.copy()
+                        if coasting:
+                            # ① 惰性追跡中は凍結しない: 予測姿勢から進めた F の生姿勢をそのまま出力し、保持姿勢も更新する
+                            fusion_hold_pose = poses_by_key["F"].copy()
+                        elif (PREDICT_ENABLED and now_t - fusion_no_member_since <= FUSION_HOLD_PREDICT_MAX_SEC
+                              and float(np.linalg.norm(pose_vel_t)) >= COAST_MIN_SPEED_M_PER_FRAME):
+                            # 案 B: 動いている最中に歯群が全部隠れたら、保持姿勢を直前の速度で進める（速度は減衰させる）
+                            fusion_hold_pose = _predict_pose_by_velocity(fusion_hold_pose, pose_vel_t, pose_vel_rv)
+                            pose_vel_t = pose_vel_t * COAST_VEL_DECAY
+                            pose_vel_rv = pose_vel_rv * COAST_VEL_DECAY
+                            poses_by_key["F"] = fusion_hold_pose.copy()
+                        else:
+                            poses_by_key["F"] = fusion_hold_pose.copy()
                         display_anchor = ""
                 active_anchor = "F"
             pose = poses_by_key[active_anchor]
@@ -3279,6 +3623,7 @@ while True:
             # 前フレームの出力から大きく跳んだ姿勢・画面外・異常な奥行きは採用せず、前フレーム姿勢に
             # 全ボディを戻してやり直させる。実物が本当に速く動いた場合は追従が遅れるだけで、ロスト判定と
             # 再ロックが通常どおり働く。
+            depth_window_hit = False
             if prev_output_pose is not None and time.time() - last_recovery_time > 0.5:
                 jump_m = float(np.linalg.norm(pose[:3, 3] - prev_output_pose[:3, 3]))
                 jump_deg = rotation_angle_deg(pose, prev_output_pose)
@@ -3287,6 +3632,13 @@ while True:
                 off_screen = (center_now is None or center_now[0] < 0 or center_now[0] > w
                               or center_now[1] < 0 or center_now[1] > h)
                 hard_bad = not (POSE_DEPTH_MIN_M < depth_now < POSE_DEPTH_MAX_M) or off_screen
+                # 奥行きの窓（2026-10-14 13:12 run）: 誤ロックで F が台座模様に合いながら 1 s で奥行き 13→28 cm に滑った
+                # （1 フレームの跳びは 2〜3 mm なので跳び量ゲートを通り、q 0.9 なので last_good も更新され続けた）。
+                # 追跡開始時の奥行きを基準に、そこから大きく外れた姿勢は不正とみなす（デモ中にカメラ距離が 1.5 倍変わることはない）。
+                if session_depth_ref is not None and not (
+                        session_depth_ref * DEPTH_WINDOW_MIN_RATIO < depth_now < session_depth_ref * DEPTH_WINDOW_MAX_RATIO):
+                    hard_bad = True
+                    depth_window_hit = True
                 jumped = jump_m > POSE_JUMP_MAX_TRANS_M or jump_deg > POSE_JUMP_MAX_ROT_DEG
                 accept_jump = False
                 if jumped and not hard_bad:
@@ -3329,16 +3681,67 @@ while True:
                         active_anchor = "F"       # 跳んだのが歯群なら F に戻す（歯群ボディは拘束が弱い）
                         anchor_switch_pose = None
                     if gate_reject_streak >= POSE_JUMP_STUCK_FRAMES:
-                        print(f"跳び量ゲート: {gate_reject_streak} フレーム連続で拒否 → 保持姿勢が古いとみなして自動再ロック")
+                        print(f"跳び量ゲート: {gate_reject_streak} フレーム連続で拒否 → 保持姿勢が古いとみなして自動再ロック"
+                              + ("（奥行き窓の外なので last_good を信用せず並進探索）" if depth_window_hit else ""))
                         force_relock = True
+                        if depth_window_hit:
+                            relock_fail_count = max(relock_fail_count, RELOCK_FAILS_BEFORE_SEARCH)
                         gate_reject_streak = 0
                 else:
                     gate_reject_streak = 0
+            # ① 出力速度の更新（惰性追跡の予測に使う）。直前フレームの品質が LOSS 以上のときだけ更新し、
+            #    再ロック直後（prev_output_pose=None）や跳びは除外する。
+            if prev_output_pose is not None and snap_frames == 0 and last_quality >= QUALITY_LOSS_THRESHOLD:
+                _dtv = (pose[:3, 3] - prev_output_pose[:3, 3]).astype(np.float64)
+                if float(np.linalg.norm(_dtv)) <= COAST_VEL_MAX_M:
+                    _drv, _ = cv2.Rodrigues(pose[:3, :3].astype(np.float64) @ prev_output_pose[:3, :3].astype(np.float64).T)
+                    pose_vel_t = COAST_VEL_ALPHA * _dtv + (1.0 - COAST_VEL_ALPHA) * pose_vel_t
+                    pose_vel_rv = COAST_VEL_ALPHA * _drv.ravel() + (1.0 - COAST_VEL_ALPHA) * pose_vel_rv
+            elif prev_output_pose is None or snap_frames > 0:
+                pose_vel_t = np.zeros(3)
+                pose_vel_rv = np.zeros(3)
             prev_output_pose = pose.copy()
             # ロスト/良好判定は単体アンカーの値ではなく剛体整合スコア（A/B/C 平均）で行う。
             # 1フレームの値は ±0.1 程度ばらつくので EMA で平滑化した値を判定に使う。
             quality_raw = estimate_rigid_quality(dist_map, pose)
-            quality_raw_f = quality_raw   # F ジオメトリでの剛体整合（歯群のブーストなし）
+            quality_raw_f = quality_raw   # F ジオメトリでの剛体整合（歯群のブーストなし）。last_good 更新はこの厳しい値で
+            if LOST_SCORE_MODE == "top2":
+                # ② 1 歯群が隠れただけで HOLD に落ちないように、A/B/C/D 上位 2 つの平均も見る（判定にだけ使う）
+                quality_raw = max(quality_raw, estimate_rigid_quality(dist_map, pose, keys=LOST_SCORE_LENIENT_KEYS,
+                                                                      top_k=LOST_SCORE_LENIENT_TOP_K))
+            # ── 歯でない場所への誤ロック検知（F 追跡中だけ。統合中は手が歯を覆うので判定しない）──
+            nontooth_reason = ""
+            if NONTOOTH_CHECK_ENABLED and not fusion_off_f and active_anchor == "F" and snap_frames == 0:
+                if frame_idx % NONTOOTH_EVAL_EVERY == 0:
+                    _fill = estimate_fill_quality(compute_tooth_mask(frame_img), pose)
+                    nontooth_fill_ema = _fill if nontooth_fill_ema is None else (
+                        NONTOOTH_FILL_EMA_ALPHA * _fill + (1.0 - NONTOOTH_FILL_EMA_ALPHA) * nontooth_fill_ema)
+                _now = time.time()
+                if (nontooth_fill_ema is not None and nontooth_fill_ema < NONTOOTH_FILL_MIN
+                        and last_quality >= NONTOOTH_MIN_QUALITY):
+                    if nontooth_last_t is not None:
+                        nontooth_low_sec += min(_now - nontooth_last_t, 0.2)
+                    nontooth_reason = f"model projects onto non-tooth pixels ({nontooth_fill_ema:.2f}) for {nontooth_low_sec:.1f}s - likely false lock"
+                    _trigger = (nontooth_low_sec >= NONTOOTH_SEC
+                                or (nontooth_fill_ema < NONTOOTH_FILL_SEVERE and nontooth_low_sec >= NONTOOTH_SEVERE_SEC))
+                    if _trigger and not force_relock:
+                        print(f"誤ロック検知: q={last_quality:.2f} なのに F 内部点の歯色一致 {nontooth_fill_ema:.2f} < {NONTOOTH_FILL_MIN} が "
+                              f"{nontooth_low_sec:.1f} s 続いた → 並進探索で再ロック")
+                        force_relock = True
+                        relock_fail_count = max(relock_fail_count, RELOCK_FAILS_BEFORE_SEARCH)   # last_good も汚れているので近傍ではなく並進探索へ
+                        frame_event = (frame_event + ";" if frame_event else "") + f"nontooth_relock fill{nontooth_fill_ema:.2f}"
+                        nontooth_low_sec = 0.0
+                        nontooth_fill_ema = None
+                else:
+                    nontooth_low_sec = 0.0   # 歯色に乗っている（または q が低い）→ 疑いを解除
+                nontooth_last_t = _now
+            else:
+                # 統合中／SNAP 中は評価しない。タイマーは止めるだけで、F に戻ったら続きから数える
+                # （13:12 run では F ↔ 統合が 1 s ごとに入れ替わり、毎回リセットされて 13 s の誤ロックを見逃した）
+                nontooth_last_t = None
+                if snap_frames > 0:
+                    nontooth_low_sec = 0.0
+                    nontooth_fill_ema = None
             if HIERARCHICAL_ANCHORS and fusion_active and fusion_keys:
                 # 統合中は、使っている歯群の適合度の平均も「追跡できている」根拠に含める
                 quality_raw = max(quality_raw, float(np.mean([quality_by_key.get(k, 0.0) for k in fusion_keys])))
@@ -3358,6 +3761,10 @@ while True:
                 if quality_raw_f >= QUALITY_GOOD_THRESHOLD:
                     last_good_pose = pose.copy()
                     last_good_time = time.time()
+                    if session_depth_ref is None and not fusion_off_f:
+                        session_depth_ref = float(pose[2, 3])
+                        print(f"奥行き基準を設定: {session_depth_ref*100:.1f} cm（許容 {session_depth_ref*DEPTH_WINDOW_MIN_RATIO*100:.0f}〜"
+                              f"{session_depth_ref*DEPTH_WINDOW_MAX_RATIO*100:.0f} cm）")
                 recovery_escalated = False
                 # 自動登録用のストリークは GOOD よりさらに厳しい閾値で数える
                 good_streak = good_streak + 1 if last_quality >= AUTO_CAPTURE_MIN_QUALITY else 0
@@ -3449,20 +3856,48 @@ while True:
                            and time.time() - last_good_time <= LAST_GOOD_MAX_AGE_SEC)
         holding = False
         hold_text = ""
+        coasting = False
         if snap_frames > 0 or last_quality >= QUALITY_LOSS_THRESHOLD or not last_good_fresh:
             # 品質OK / スナップ中 / last_good_pose が古すぎる → 現在の pose で同期。
             # 古い last_good_pose へ毎フレーム引き戻すと「固まってから飛ぶ」動きになる。
-            reset_all_anchors(pose)
+            # 案 B: 統合中、または F 追跡中でも速く動いているときは、速度で 1 フレーム先を予測した姿勢から次の step を始める
+            _start = pose
+            if PREDICT_ENABLED and snap_frames == 0:
+                if fusion_off_f or float(np.linalg.norm(pose_vel_t)) >= PREDICT_F_MIN_SPEED_M:
+                    _start = _predict_pose_by_velocity(pose, pose_vel_t, pose_vel_rv)
+            reset_all_anchors(_start)
             poses_by_key = {a["key"]: pose for a in ANCHORS}
+            coast_decided = False
         else:
-            # HOLD: 遮蔽の可能性があるので最後の良好姿勢から毎フレーム再試行する。
-            # 遮蔽が去ればそのまま再ロック、HOLD_BEFORE_RECOVERY_SEC を過ぎれば自動再ロックへ。
             holding = True
             held = time.time() - lost_start_time if lost_start_time is not None else 0.0
-            hold_text = f"  HOLD {held:.1f}s"
-            mode_text = f"{mode_text} hold"
-            reset_all_anchors(last_good_pose)
-            poses_by_key = {a["key"]: last_good_pose for a in ANCHORS}
+            if not coast_decided:
+                # ① HOLD に入った瞬間に 1 回だけ判定: 直前まで模型が動いていたなら惰性で追う
+                coast_decided = True
+                _speed = float(np.linalg.norm(pose_vel_t))
+                if COAST_ENABLED and _speed >= COAST_MIN_SPEED_M_PER_FRAME:
+                    coast_until = time.time() + COAST_MAX_SEC
+                    print(f"HOLD: 直前の速度 {_speed*1000:.2f} mm/フレーム ({_speed*1000*24:.0f} mm/s) → "
+                          f"{COAST_MAX_SEC:.1f} s は凍結せず惰性で追う")
+                else:
+                    coast_until = 0.0
+            if time.time() < coast_until:
+                # ① 惰性追跡: last_good に戻さず、速度で 1 フレーム先を予測した姿勢から M3T を進める
+                coasting = True
+                hold_text = f"  COAST {held:.1f}s"
+                mode_text = f"{mode_text} coast"
+                _pred = _predict_pose_by_velocity(pose, pose_vel_t, pose_vel_rv)
+                pose_vel_t = pose_vel_t * COAST_VEL_DECAY
+                pose_vel_rv = pose_vel_rv * COAST_VEL_DECAY
+                reset_all_anchors(_pred)
+                poses_by_key = {a["key"]: _pred for a in ANCHORS}
+            else:
+                # HOLD: 遮蔽の可能性があるので最後の良好姿勢から毎フレーム再試行する。
+                # 遮蔽が去ればそのまま再ロック、HOLD_BEFORE_RECOVERY_SEC を過ぎれば自動再ロックへ。
+                hold_text = f"  HOLD {held:.1f}s"
+                mode_text = f"{mode_text} hold"
+                reset_all_anchors(last_good_pose)
+                poses_by_key = {a["key"]: last_good_pose for a in ANCHORS}
 
         # ── ② 回転不確か警告: 統合中（回転固定）が長い／大きく動いた、HOLD 中、F 復帰直後 ──
         rotation_uncertain_reason = ""
@@ -3471,8 +3906,16 @@ while True:
             _ref_pose = fusion_hold_pose if fusion_hold_pose is not None else anchor_switch_pose
             _moved = float(np.linalg.norm(_group_center_cam("F", _ref_pose) - _group_center_cam("F", anchor_switch_pose)))
             if _since >= ROT_UNCERTAIN_AFTER_SEC or _moved >= ROT_UNCERTAIN_MOVE_M:
-                rotation_uncertain_reason = (f"occluded {_since:.0f}s, arch moved {_moved*1000:.0f}mm "
-                                             f"while rotation is frozen")
+                _rot_text = (f"rotation following group {fusion_rot_src} ({fusion_rot_total_deg:.0f} deg so far, weak)"
+                             if fusion_rot_src else "while rotation is frozen")
+                rotation_uncertain_reason = f"occluded {_since:.0f}s, arch moved {_moved*1000:.0f}mm, {_rot_text}"
+        elif return_search_job is not None:
+            rotation_uncertain_reason = (f"re-checking rotation after return "
+                                         f"({len(return_search_job['results'])}/{len(return_search_job['cands'])})")
+        elif nontooth_reason:
+            rotation_uncertain_reason = nontooth_reason
+        elif coasting:
+            rotation_uncertain_reason = "lost sight - coasting on predicted motion (verify alignment)"
         elif holding:
             rotation_uncertain_reason = "holding last good pose (lost)"
         elif time.time() < rotation_uncertain_until:
@@ -3481,10 +3924,36 @@ while True:
         # マーカー基準との差はログ書き込みの前に計算する（HUD 側はこの値を表示するだけ）
         if marker_ref is not None and marker_ref.is_registered():
             marker_err = marker_ref.error(pose)
-        log_frame(frame_idx, f"{mode_text}[{'+'.join(fusion_keys) if fusion_active and fusion_keys else active_anchor}]",
+            # 基準が古い疑い: F が良好に追跡しているのに誤差が大きい状態が続く（ボードか模型が動いた）
+            _stale_now = (marker_err is not None and not fusion_off_f and not holding
+                          and quality_by_key.get("F", 0.0) >= MARKER_STALE_MIN_QF
+                          and marker_err["mm"] > MARKER_STALE_ERR_MM)   # marker_err["mm"] は mm 単位
+            if _stale_now:
+                marker_stale_since = marker_stale_since or time.time()
+                if not marker_stale_warned and time.time() - marker_stale_since >= MARKER_STALE_SEC:
+                    marker_stale_warned = True
+                    # 12:45 run: 復帰時再探索が誤った局所解に落とし q 0.92 のまま 32 mm ずれ続けた例があり、同じ条件で出る。
+                    # 「基準が古い」とは限らないので、両方の可能性を示す
+                    marker_status_text = (f"ArUco disagrees by {marker_err['mm']:.0f} mm / {marker_err['deg']:.0f} deg while q is high: "
+                                          "tracker may be in a wrong local minimum (re-align), or the reference is stale (re-register)")
+                    print(f"ArUco と不一致: F q={quality_by_key.get('F', 0.0):.2f} なのに誤差 {marker_err['mm']:.0f} mm / {marker_err['deg']:.0f}° が "
+                          f"{MARKER_STALE_SEC:.0f} s 以上続いている → トラッカーが誤った局所解にいる（Quick Align で合わせ直し）か、"
+                          "ボード/模型が動いて基準が古い（登録し直し）")
+            else:
+                marker_stale_since = None
+                if marker_err is not None and marker_err["mm"] <= MARKER_STALE_ERR_MM * 0.5:
+                    marker_stale_warned = False   # 登録し直して誤差が戻ったら、次に古くなったときまた警告できるように
+        # mode 列の [..]: 統合中の姿勢源。統合で F を離れているのに使える歯群がない（保持/予測）フレームは "-"
+        # （以前は "F" と出て、遮蔽なしの F 追跡と区別できなかった）
+        _src_label = ("+".join(fusion_keys) if fusion_active and fusion_keys
+                      else ("-" if fusion_off_f else active_anchor))
+        log_frame(frame_idx, f"{mode_text}[{_src_label}]",
                   last_quality, pose, quality_by_key, quality_raw,
                   marker_err, group_poses=group_poses_raw, event=frame_event,
-                  rot_uncertain=int(bool(rotation_uncertain_reason)))
+                  rot_uncertain=int(bool(rotation_uncertain_reason)),
+                  fus_rot_src=fusion_rot_src if fusion_off_f else "",
+                  fus_rot_deg=fusion_rot_total_deg if fusion_off_f else None,
+                  fill_q=nontooth_fill_ema)
         if diag_frame_dir is not None and frame_idx % DIAG_FRAME_DUMP_EVERY == 0:
             # ディスク書き込みはメインループから外す（数百 ms 固まる原因になり得る）
             threading.Thread(target=cv2.imwrite,
