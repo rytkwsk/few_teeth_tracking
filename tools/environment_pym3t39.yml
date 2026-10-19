@@ -1,0 +1,15 @@
+# few_teeth_tracking トラッカー用の conda 環境（2026-10-19 研究室 PC の pym3t39 から作成）。
+# pym3t.cp39-win_amd64.pyd は Python 3.9 用にビルドしてあるので python は 3.9 系に固定する。
+#   conda env create -f tools/environment_pym3t39.yml
+# tools/setup_pc.ps1 が環境が無いときに自動でこれを使う。
+name: pym3t39
+channels:
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - pip:
+      - numpy==2.0.2
+      - opencv-python==4.13.0.92
+      - pygrabber==0.2
+      - comtypes==1.4.16

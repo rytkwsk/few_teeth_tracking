@@ -12,6 +12,17 @@ ArUco 基準の実測（mm / deg）で判断すること。
 | `../unity-few-teeth-tracking/` | Unity 2022.3.48f1。`M3TProcessController` がこのトラッカーを conda 経由で起動、`M3TPoseReceiver` が UDP 5005 で姿勢受信、映像は TCP 5010、コマンドは UDP 5006 | rytkwsk/unity-few-teeth-tracking |
 | `../pym3t/` | M3T の Python バインディング（C++）。**remote は本家 Jianxff/pym3t で Git 管理されていない**。ビルド成果物・キャリブ・モデルはここにローカルに置かれている | なし |
 
+## 新しい PC のセットアップ（2026-10-19〜）
+
+研究室 PC で作った USB 用フォルダ `m3t_bundle`（dist_release・initial_poses・models_meta）を持っていき、
+2 つのリポジトリを同じ親フォルダに clone してから `few_teeth_tracking` で実行する:
+
+    powershell -ExecutionPolicy Bypass -File tools\setup_pc.ps1 -Bundle <m3t_bundle のパス>
+
+conda 環境 pym3t39 の作成（`tools/environment_pym3t39.yml`）、環境変数、下の 1〜4 の配置と点検（import pym3t・キャリブ解像度・
+VC++・Unity・iVCam・Apple Mobile Device Support）をまとめて行う。`-CheckOnly` で変更せず点検だけ。
+bundle を作り直すときは研究室 PC で `pym3t/dist_release`、`initial_poses/<model_key>/`（.bak 除く）、`models/*.meta` を集める。
+
 ## PC ごとに必要な設定（Git では同期されないもの）
 
 1. **conda 環境名**: シーンの既定は `pym3t`。環境名が違う PC は環境変数 `M3T_CONDA_ENV` で上書き
