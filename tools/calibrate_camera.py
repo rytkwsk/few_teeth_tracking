@@ -2,8 +2,15 @@ import argparse
 import glob
 import os
 
+import sys
+
 import cv2
 import numpy as np
+
+# リポジトリ直下の camera_io.py（OS に合ったカメラのバックエンド、m3t_local.env の読み込み）を使う
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import camera_io  # noqa: E402
+camera_io.load_local_env()
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -13,7 +20,8 @@ DEFAULT_OUTPUT_PATH = os.path.join(SCRIPT_DIR, "camera_calibration.npz")
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera", type=int, default=camera_io.camera_index(),
+                        help="Camera index (default: M3T_CAMERA_INDEX or 0). Find it with tools/list_cameras.py.")
     parser.add_argument("--cols", type=int, default=9, help="Inner checkerboard corners per row.")
     parser.add_argument("--rows", type=int, default=6, help="Inner checkerboard corners per column.")
     parser.add_argument("--square-mm", type=float, default=25.0, help="Checkerboard square size in mm.")
@@ -29,19 +37,14 @@ def parse_args():
 def capture_images(camera_index, image_dir, pattern_size, width=None, height=None):
     os.makedirs(image_dir, exist_ok=True)
 
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        raise RuntimeError("camera open failed")
-
     # Capture at the same resolution the tracker uses, so the saved K matches.
-    if width and height:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"camera resolution: requested {width}x{height}, actual {aw}x{ah}")
-        if (aw, ah) != (width, height):
-            print("WARNING: camera did not accept the requested resolution.")
+    # Backend: DirectShow on Windows, AVFoundation on macOS (camera_io.py).
+    if not (width and height):
+        width, height = camera_io.camera_size()
+    cap, (aw, ah) = camera_io.open_camera(camera_index, width, height)
+    if (aw, ah) != (width, height):
+        print("WARNING: camera did not accept the requested resolution; the calibration will be saved for "
+              f"{aw}x{ah}. Set M3T_CAMERA_WIDTH/HEIGHT to that size so the tracker uses this K.")
 
     existing = glob.glob(os.path.join(image_dir, "calib_*.png"))
     next_index = len(existing)

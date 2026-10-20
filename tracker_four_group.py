@@ -40,6 +40,12 @@ if os.name == "nt" and os.path.isdir(_conda_lib_bin):
 # few_teeth_tracking は pym3t とは別ディレクトリに配置されているため、
 # pym3t.pyd 等の所在地を明示的に指定する。
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+# PC ごとの設定（PYM3T_DIR・カメラ番号など）。Mac では GUI の Unity にシェルの環境変数が渡らないのでファイルで持つ。
+# 環境変数が既にあればそちらを優先する（camera_io.py 参照）。
+import camera_io  # noqa: E402
+_local_env_keys = camera_io.load_local_env()
+if _local_env_keys:
+    print(f"m3t_local.env から読み込み: {', '.join(_local_env_keys)}")
 PYM3T_DIR = os.path.abspath(os.environ.get("PYM3T_DIR", os.path.join(os.path.dirname(REPO_DIR), "pym3t")))
 sys.path.insert(0, PYM3T_DIR)
 
@@ -577,17 +583,14 @@ CAMERA_MANUAL_EXPOSURE = -6
 # 追跡・基準の両方の精度下限が改善する。解像度を変えたら calibrate_camera.py で再キャリブレーション
 # すること（camera_calibration.npz の image_width/height と一致しないと仮の K になる）。
 # None にすると配信アプリの既定値をそのまま使う。
-CAMERA_WIDTH  = 1280
-CAMERA_HEIGHT = 720
+# カメラ番号・バックエンド・解像度は camera_io.py（環境変数 / m3t_local.env）で PC ごとに変えられる。
+# 既定は Windows=DirectShow / Mac=AVFoundation、カメラ 0、1280x720。
+CAMERA_WIDTH, CAMERA_HEIGHT = camera_io.camera_size((1280, 720))
+# 露出の手動設定は Windows（DirectShow）だけ。AVFoundation は未対応の値を受けて挙動が変わることがあるので触らない
+if os.name != "nt":
+    CAMERA_MANUAL_EXPOSURE = None
 
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-if CAMERA_WIDTH and CAMERA_HEIGHT:
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-    _aw, _ah = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if (_aw, _ah) != (CAMERA_WIDTH, CAMERA_HEIGHT):
-        print(f"カメラ解像度: 要求 {CAMERA_WIDTH}x{CAMERA_HEIGHT} に対し実際は {_aw}x{_ah}"
-              "（配信アプリ側の解像度設定を確認）")
+cap, _ = camera_io.open_camera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT)
 
 if CAMERA_MANUAL_EXPOSURE is not None:
     cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)

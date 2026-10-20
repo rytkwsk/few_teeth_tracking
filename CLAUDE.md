@@ -12,6 +12,22 @@ ArUco 基準の実測（mm / deg）で判断すること。
 | `../unity-few-teeth-tracking/` | Unity 2022.3.48f1。`M3TProcessController` がこのトラッカーを conda 経由で起動、`M3TPoseReceiver` が UDP 5005 で姿勢受信、映像は TCP 5010、コマンドは UDP 5006 | rytkwsk/unity-few-teeth-tracking |
 | `../pym3t/` | M3T の Python バインディング（C++）。**remote は本家 Jianxff/pym3t で Git 管理されていない**。ビルド成果物・キャリブ・モデルはここにローカルに置かれている | なし |
 
+## Mac のセットアップ（2026-10-20〜、Mac 上ではまだ未検証）
+
+2 つのリポジトリを同じ親フォルダに clone して、`few_teeth_tracking` で `bash tools/setup_mac.sh`（`--check` で点検だけ、
+`--bundle <m3t_bundle>` で初期姿勢・ArUco 登録・region キャッシュも取り込み、`--rebuild` で pym3t 再ビルド）。
+- **pym3t**: 本家 Jianxff/pym3t を `<親>/pym3t` に clone し、`tools/pym3t_patches/pym3t_local.patch`（base b4d62f0。
+  Windows ビルド設定・`<m3t/link.h>` 修正・macOS の GL forward-compat と libomp リンク）を当て、Homebrew の
+  cmake eigen glfw glew opencv libomp で `<親>/pym3t/dist_mac` にビルド。研究室 PC の pym3t 作業ツリーにも同じ変更が入っている
+  （Mac 用は `__APPLE__` / `if(APPLE)` で囲んであり Windows のビルドには影響しない）。
+- **設定**: Mac の GUI アプリ（Unity Hub）にはシェルの環境変数が渡らないので、PC ごとの値は `m3t_local.env`（gitignore）に書く。
+  Unity の `M3TProcessController` とトラッカー（`camera_io.py`）の両方が読む。優先順位は 環境変数 > m3t_local.env > レジストリ（Windows のみ）。
+  Mac では conda activate を使わず、conda 環境の python を直接起動する（`M3T_PYTHON_EXE`、無ければ miniforge3 等から探す）。
+- **カメラ**: iVCam は Windows 専用。Mac は iPhone の**連係カメラ**（AVFoundation）。番号は 0 とは限らないので
+  `python tools/list_cameras.py` で調べて `M3T_CAMERA_INDEX` に書く。カメラの経路が違うので**キャリブは Mac で取り直す**
+  （出力先 `<親>/pym3t/dist_mac/camera_calibration.npz`）。初回はターミナル／Unity にカメラ許可のダイアログが出る。
+- 露出の手動設定は Windows（DirectShow）だけ。conda 環境定義は conda-forge（defaults は新しい conda で利用規約の同意待ちで止まる）。
+
 ## 新しい PC のセットアップ（2026-10-19〜）
 
 研究室 PC で作った USB 用フォルダ `m3t_bundle`（dist_release・initial_poses・models_meta）を持っていき、
