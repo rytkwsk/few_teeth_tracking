@@ -1,6 +1,7 @@
 import argparse
 import glob
 import os
+import time
 
 import sys
 
@@ -54,17 +55,46 @@ def capture_images(camera_index, image_dir, pattern_size, width=None, height=Non
     print("s: save image even if corners are not detected")
     print("q or Esc: finish capture")
 
+    # プレビューのチェッカーボード検出は別スレッドで最新フレームにだけ行う。メインループで毎フレーム検出していたときは
+    # （1280x720・高速チェックなし）ボードが見つからないフレームで約 300 ms かかり、映像が溜まって重かった。
+    # 検出は半分の大きさ・高速チェック付き（見つからないフレームで約 90 ms）。Space では、検出できたそのフレームを
+    # 元の解像度で保存する（計算時に保存画像から検出し直す）。
+    import threading
+    lock = threading.Lock()
+    state = {"pending": None, "result": None, "stop": False}
+    flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_FAST_CHECK
+
+    def detect_worker():
+        while True:
+            with lock:
+                if state["stop"]:
+                    return
+                job, state["pending"] = state["pending"], None
+            if job is None:
+                time.sleep(0.005)
+                continue
+            frame_bgr = job
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            small = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            found, corners = cv2.findChessboardCorners(small, pattern_size, flags)
+            with lock:
+                state["result"] = (found, corners * 2.0 if found else None, frame_bgr, time.time())
+
+    worker = threading.Thread(target=detect_worker, daemon=True)
+    worker.start()
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        found, corners = cv2.findChessboardCorners(gray, pattern_size)
+        with lock:
+            state["pending"] = frame        # 検出が追いつかないフレームは捨てて最新だけを渡す
+            result = state["result"]
+        found = bool(result and result[0] and time.time() - result[3] < 0.5)
 
         display = frame.copy()
         if found:
-            cv2.drawChessboardCorners(display, pattern_size, corners, found)
+            cv2.drawChessboardCorners(display, pattern_size, result[1], True)
 
         cv2.putText(
             display,
@@ -82,7 +112,7 @@ def capture_images(camera_index, image_dir, pattern_size, width=None, height=Non
             break
         if key == 32 and found:
             path = os.path.join(image_dir, f"calib_{next_index:03d}.png")
-            cv2.imwrite(path, frame)
+            cv2.imwrite(path, result[2])    # コーナーを検出できたフレームそのもの
             print("saved", path)
             next_index += 1
         elif key == ord("s"):
@@ -91,6 +121,9 @@ def capture_images(camera_index, image_dir, pattern_size, width=None, height=Non
             print("saved without detected corners", path)
             next_index += 1
 
+    with lock:
+        state["stop"] = True
+    worker.join(timeout=1.0)
     cap.release()
     cv2.destroyAllWindows()
 

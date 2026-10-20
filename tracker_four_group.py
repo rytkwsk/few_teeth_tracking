@@ -348,12 +348,46 @@ FUSION_ROT_MOTION_MIN_POINTS = 8
 FUSION_ROT_SOURCE        = os.environ.get("M3T_FUSION_ROT_SOURCE", "pnp").lower()
 FUSION_PNP_MAX_FEATURES  = 300
 FUSION_PNP_MIN_POINTS    = 12      # 生きている点がこれ未満なら回転は保持
+# ⑨ 特徴点 PnP の画像の倍率（2026-10-20）。以前は品質評価と同じ半分の大きさ（0.5）で検出・追跡していた。元の解像度（1.0）にすると
+#   歯の上の点が増え、LK の位置精度も上がる想定。以下の px のしきい値は「半分の大きさの画像での px」として書いてあり、
+#   使う場所で FUSION_PNP_PX（= 倍率 / 0.5）を掛けて換算する。
+#   実機（20:18・20:28 run）では 1.0 の方が悪かった（20:01 の 0.5 は統合中 43% が 2 mm・2° 未満、1.0 は 0〜13%）ので既定は 0.5 に戻した。
+#   M3T_FUSION_PNP_SCALE=1.0 で元の解像度。
+FUSION_PNP_SCALE         = float(os.environ.get("M3T_FUSION_PNP_SCALE", "0.5"))
+FUSION_PNP_PX            = FUSION_PNP_SCALE / 0.5
+FUSION_PNP_MAX_POINTS    = int(round(FUSION_PNP_MAX_FEATURES * FUSION_PNP_PX))   # 元の解像度では 600 点まで
+
+
+def _pnp_px(v):
+    """半分の大きさの画像で決めた px を、特徴点 PnP の画像の px に換算する。"""
+    return v * FUSION_PNP_PX
+
+
+def _pnp_odd(v):
+    """カーネル・窓の大きさ（奇数）を倍率に合わせる。"""
+    n = int(round(v * FUSION_PNP_PX))
+    return n if n % 2 == 1 else n + 1
 FUSION_PNP_FB_MAX_PX     = 0.8     # 前後追跡の往復誤差（縮小画像 px）。0.5 は奥行き方向の移動（拡大縮小）で点を捨て過ぎた
 # ⑤ 点の補充（11:50 run）: 遮蔽中に奥行き方向へ動かすと点が 1.5 s で 43→11 と減り PnP(bad) → 歯群重心（奥行き固定）に
 #   戻って追えなかった（142.5 s: 真値 −13.6 mm に対し出力 +9.2 mm）。生存点がこれ未満になったら、解が信用できる
 #   （残差中央値 ≤ FUSION_PNP_REFRESH_MAX_RES_PX）ときに今の姿勢で歯色の画素から点を取り直して足す。
 FUSION_PNP_REFRESH_BELOW     = 40
 FUSION_PNP_REFRESH_MAX_RES_PX = 1.0
+# ⑧ 見えている歯の輪郭を特徴点と一緒に使う（2026-10-20 20:01 run、Choi & Christensen IJRR 2012 のキーポイント＋エッジの考え方）:
+#   遮蔽中に 25〜35° 回すと、歯の上の特徴点が 35〜39 まで減り、補充のたびに今のずれた姿勢で点を結び付けるので回転の取りこぼし
+#   （9〜11°）が固まった。統合に使っている歯群（見えている歯）の稜線を投影し、向き付きエッジ距離マップ（品質評価と同じ）で
+#   画像のエッジまでの距離を残差に加えて、特徴点と一緒に姿勢を解く。距離は FUSION_PNP_EDGE_MAX_PX で打ち切る（手や別の
+#   エッジに引かれないように）。輪郭の重みは「輪郭の合計 ≈ 特徴点の合計 × FUSION_PNP_EDGE_REL」になるよう自動で決める。
+#   補充は、その姿勢で見えている歯群の輪郭の適合度が FUSION_PNP_REFRESH_MIN_EDGE_Q 以上のときだけ。歯肉・台座など歯以外は使わない。
+#   **結果（20:01 run の保存フレームで再生）: 悪化したので既定 OFF**（M3T_FUSION_PNP_EDGE=1 で有効）。回転区間の PnP 回転誤差
+#   中央値 0.7→1.3° / 6.7→23.3° / 4.8→15.6°。正しい姿勢でも稜線の標本点からエッジまで中央値 2.4〜3.0 px（1 px 以内 14〜19%）で、
+#   打ち切り 4 / 2 / 1 px のどれでも、4 フレームとも「カメラ x 軸まわり +6°」の方がコストが小さい（系統的な偏り。切り出した
+#   歯群メッシュの切り口の稜線や、歯頸部・台座の密なエッジに引かれる）。歯の稜線は 2 mm・2° の精度の手がかりにならない。
+FUSION_PNP_USE_EDGES          = os.environ.get("M3T_FUSION_PNP_EDGE", "0") == "1"
+FUSION_PNP_EDGE_MAX_PER_GROUP = 200     # 歯群ごとに使う稜線の数（1 本あたり 3 点を標本化）
+FUSION_PNP_EDGE_MAX_PX        = 4.0     # 縮小画像 px（品質評価の QUALITY_EDGE_MAX_DIST_PX と同じ）
+FUSION_PNP_EDGE_REL           = float(os.environ.get("M3T_FUSION_PNP_EDGE_REL", "1.0"))
+FUSION_PNP_REFRESH_MIN_EDGE_Q = 0.55
 FUSION_PNP_OUTLIER_PX    = 2.0     # 剛体運動に合わない点（手・反射）はこの残差で永久に捨てる（1.5 は回転中に点が減り過ぎた）
 # 15:48 run（実機、静止模型）: 手が入る瞬間に生存点が 125→78 / 65→41 と減り、残った点の一部が手に引きずられて
 # PnP が σ 0.2〜0.4° のまま 6〜16° 回った（前後追跡チェックは滑らかな手の動きを捕まえられない）。
@@ -361,6 +395,16 @@ FUSION_PNP_OUTLIER_PX    = 2.0     # 剛体運動に合わない点（手・反�
 #   （手に引きずられる点は少数なので中央値はほぼ動かない。3° の回転で歯の点は約 5 px 動く）
 # ② 前回の解とキーフレーム姿勢の両方から解き、1 px 以内の点が多い方を採る（手と歯の折衷解に居座らないように）
 FUSION_PNP_STILL_PX      = float(os.environ.get("M3T_FUSION_PNP_STILL_PX", "0.6"))   # 縮小画像 px
+# ⑩ 手に引きずられた点の除去（2026-10-20 20:18 run、元の解像度で点が 3 倍になった後）: 静止判定のあいだ、手に覆われた点の一部は
+#   指の表面を追って動き続けた（模型の点が多数なので中央値は動かず静止のまま）。模型が少し動いた瞬間に解くと手の点に合う解
+#   （真値 0.9° に対し 17〜24°）に落ち、外れ値除去で模型の点（多数派）を捨てて 212→89 点、σ 0.2° のまま誤った回転を出し続けた。
+#   (a) 静止判定のあいだにキーフレームから FUSION_PNP_STILL_DROP_PX 以上動いた点は模型の上の点ではないので捨てる。
+#   (b) 解に合う点が解く前の点の FUSION_PNP_MIN_INLIER_FRAC 未満なら、その解は信用せず点も捨てない（少数派の解を採らない）。
+#       20:18 の誤った解は 212 点中 104 点（49%）。正しく追えている区間の再生では 97〜100%。
+#   20:28 run（元の解像度＋⑩）で誤った急な回転は消えたが、全体は 20:01 より悪かったので、半分の解像度に戻すのに合わせて既定は切る
+#   （0 で無効）。元の解像度で使うときは M3T_FUSION_PNP_STILL_DROP_PX=1.5 M3T_FUSION_PNP_MIN_INLIER_FRAC=0.6。
+FUSION_PNP_STILL_DROP_PX   = float(os.environ.get("M3T_FUSION_PNP_STILL_DROP_PX", "0"))      # 縮小画像 px、0 で無効
+FUSION_PNP_MIN_INLIER_FRAC = float(os.environ.get("M3T_FUSION_PNP_MIN_INLIER_FRAC", "0"))    # 0 で無効
 # ③ 見た目の確認（KLT の NCC 検証）: 15:53 run 45.6 s で手に覆われた点が手と一緒に動き、静止判定もすり抜けて
 #   PnP が σ 0.3〜0.5° のまま 11〜12° 回った（真値 1°）。キーフレームでのその点まわりの小画像と今の小画像の
 #   正規化相互相関がこれ未満の点（歯→手に変わった点）は以後使わない。
@@ -373,6 +417,33 @@ FUSION_PNP_USE_TRANSLATION = os.environ.get("M3T_FUSION_PNP_TRANS", "1") != "0"
 # 統合姿勢の逸脱監視（ANCHOR_GROUP_MAX_DRIFT_M = 20 mm）は歯群ボディの流れ対策。並進を PnP で出しているときは、
 # 実際に 20 mm 前後ずらした模型を追えるよう（11:43 run）この値まで広げる。
 FUSION_PNP_MAX_DRIFT_M = 0.060
+# ⑥ F 追跡中の見張り（2026-10-20 18:53 run）: 模型をカメラへ近づけながら少し上へ動かすと（約 25 mm/s）、F が逆向き（遠ざかる側）
+#   へ 0.5 s で 30〜46 mm 跳び、約 1 s 後に戻った（qF 0.7→0.5 で F_OK 0.45 を割らないので統合にも入らない）。遮蔽中に使う
+#   キーフレーム特徴点 PnP を F 追跡中も並走させ、F が PnP から F_GUARD_DIVERGE_MM / _DEG 以上離れた状態が
+#   F_GUARD_DIVERGE_FRAMES 続いたら全アンカーを PnP の姿勢へ戻す。キーフレームは F 良好・PnP と一致しているときに
+#   F_GUARD_REKEY_SEC ごとに取り直す（補充した点の誤差を溜めない）。静止中に F が滑る場合（11:50 run 155〜165 s）も同じ仕組みで戻る。
+#   M3T_F_GUARD=0 で無効。ログ（event 列）に f_guard_reset。
+F_GUARD_ENABLED        = os.environ.get("M3T_F_GUARD", "1") != "0"
+F_GUARD_MIN_QF         = 0.60    # キーフレームを作る／取り直すときの F の最低適合度
+F_GUARD_MIN_F_SEC      = 0.3     # F で連続してこの秒数以上追跡できてからキーフレームを作る
+F_GUARD_REKEY_SEC      = 2.0
+F_GUARD_AGREE_MM       = 2.0     # 取り直してよい一致度
+F_GUARD_AGREE_DEG      = 2.0
+F_GUARD_DIVERGE_MM     = float(os.environ.get("M3T_F_GUARD_MM", "8.0"))
+F_GUARD_DIVERGE_DEG    = float(os.environ.get("M3T_F_GUARD_DEG", "8.0"))
+F_GUARD_DIVERGE_FRAMES = 2
+F_GUARD_MIN_POINTS     = 25
+F_GUARD_MAX_RES_PX     = 1.0
+# ⑦ 統合から抜け出せない状態の検知（2026-10-20 19:47 run）: 遮蔽中に回して回転が 17.6° ずれたまま PnP の点が 0 になり、
+#   手を離して A/B は q 0.7 で見えているのに、F は出力（ずれた姿勢）へ毎フレーム同期されるので q 0.52〜0.55 から上がらず
+#   復帰条件（q ≥ 0.55 が 2 s 連続 or 全歯群が見える）を満たせないまま 53 s 統合に居座った。統合が STUCK_MIN_FUSION_SEC
+#   以上続き、PnP が STUCK_PNP_BAD_SEC 以上使えず、A と B が STUCK_GROUP_Q 以上見えているのに F が戻れないときは、
+#   全探索で再ロックする（STUCK_COOLDOWN_SEC に 1 回まで）。M3T_FUSION_STUCK_RELOCK=0 で無効。
+FUSION_STUCK_RELOCK       = os.environ.get("M3T_FUSION_STUCK_RELOCK", "1") != "0"
+FUSION_STUCK_MIN_FUSION_SEC = 5.0
+FUSION_STUCK_PNP_BAD_SEC  = 3.0
+FUSION_STUCK_GROUP_Q      = 0.60
+FUSION_STUCK_COOLDOWN_SEC = 5.0
 FUSION_PNP_MAX_RES_PX    = 1.5     # 残差中央値がこれを超えたら解を信用しない
 # σ は残差中央値から出すので過大（15:24 run の保存フレームで実誤差 1.3〜2.0° のとき σ 2.0〜2.7°）。3σ / 3° だと
 # 4〜8° 回した区間を保持し続け、9° 超の良い解も捨てていたので 2σ / 5° にした。
@@ -1904,13 +1975,21 @@ def motion_from_ref(ref, gray):
     return float(np.median(np.linalg.norm((p1 - ref["pts"]).reshape(-1, 2)[ok], axis=1)))
 
 
+def _pnp_gray(bgr):
+    """特徴点 PnP 用のグレー画像（FUSION_PNP_SCALE の大きさ）。"""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    if FUSION_PNP_SCALE < 1.0:
+        gray = cv2.resize(gray, None, fx=FUSION_PNP_SCALE, fy=FUSION_PNP_SCALE, interpolation=cv2.INTER_AREA)
+    return gray
+
+
 def _pnp_project(Xc, Ks):
     return (Xc[:, :2] / Xc[:, 2:3]) * np.array([Ks[0, 0], Ks[1, 1]]) + np.array([Ks[0, 2], Ks[1, 2]])
 
 
 def _pnp_patches(gray, pts):
     """各点まわりの (2h+1)² 小画像を平均 0・ノルム 1 にして返す（NCC 用）。shape = (N, (2h+1)²)。"""
-    size = 2 * FUSION_PNP_NCC_HALF + 1
+    size = 2 * int(round(_pnp_px(FUSION_PNP_NCC_HALF))) + 1
     out = np.zeros((len(pts), size * size), np.float32)
     for i, (x, y) in enumerate(pts):
         p = cv2.getRectSubPix(gray, (size, size), (float(x), float(y))).astype(np.float32).ravel()
@@ -1922,7 +2001,7 @@ def _pnp_patches(gray, pts):
 
 def _pnp_Ks():
     Ks = K.astype(np.float64).copy()
-    Ks[:2] *= QUALITY_SCALE
+    Ks[:2] *= FUSION_PNP_SCALE
     return Ks
 
 
@@ -1946,9 +2025,12 @@ def _pnp_detect(gray, R, t, max_features, extra_mask=None):
     zb[vi[sel], ui[sel]] = z[sel]
     idb[vi[sel], ui[sel]] = vid[sel]
     sil = np.isfinite(zb).astype(np.uint8) * 255
-    sil = cv2.erode(cv2.morphologyEx(sil, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)), np.ones((3, 3), np.uint8))
+    # 元の解像度では頂点の投影が画素より疎になる（45k 頂点）ので、カーネル・探索範囲も倍率に合わせて広げる
+    k_close, k_erode = _pnp_odd(5), _pnp_odd(3)
+    sil = cv2.erode(cv2.morphologyEx(sil, cv2.MORPH_CLOSE, np.ones((k_close, k_close), np.uint8)),
+                    np.ones((k_erode, k_erode), np.uint8))
     # 隠れた頂点がたまたま画素を持つことがあるので、近傍の最前面より 4 mm 以上奥の頂点は使わない
-    zfront = cv2.erode(np.where(np.isinf(zb), 1e9, zb).astype(np.float32), np.ones((5, 5), np.uint8))
+    zfront = cv2.erode(np.where(np.isinf(zb), 1e9, zb).astype(np.float32), np.ones((k_close, k_close), np.uint8))
     if extra_mask is not None:
         sil = cv2.bitwise_and(sil, extra_mask)
     empty = (np.zeros((0, 2), np.float32), np.zeros((0, 3)))
@@ -1959,9 +2041,10 @@ def _pnp_detect(gray, R, t, max_features, extra_mask=None):
         return empty
     pts = pts.reshape(-1, 2)
     keep_pts, keep_ids = [], []
+    rad = int(round(_pnp_px(2)))
     for (x, y) in pts:
         xi, yi = int(round(x)), int(round(y))
-        y0, y1, x0, x1 = max(0, yi - 2), min(hgt, yi + 3), max(0, xi - 2), min(wid, xi + 3)
+        y0, y1, x0, x1 = max(0, yi - rad), min(hgt, yi + rad + 1), max(0, xi - rad), min(wid, xi + rad + 1)
         win_id = idb[y0:y1, x0:x1]
         valid = (win_id >= 0) & (zb[y0:y1, x0:x1] <= zfront[y0:y1, x0:x1] + 0.004)
         if not valid.any():
@@ -1978,7 +2061,7 @@ def _pnp_detect(gray, R, t, max_features, extra_mask=None):
 def pnp_keyframe_begin(gray, pose):
     """遮蔽直前の F 良好フレーム（縮小グレー）と姿勢から、メッシュに結び付いた特徴点の集合を作る。取れなければ None。"""
     R, t = pose[:3, :3].astype(np.float64), pose[:3, 3].astype(np.float64)
-    pts, X = _pnp_detect(gray, R, t, FUSION_PNP_MAX_FEATURES)
+    pts, X = _pnp_detect(gray, R, t, FUSION_PNP_MAX_POINTS)
     if len(pts) < FUSION_PNP_MIN_POINTS:
         return None
     return {"Ks": _pnp_Ks(), "X": X, "cur": pts.copy(), "kf_pts": pts.copy(),
@@ -1990,10 +2073,11 @@ def _pnp_refresh(st, gray, tooth_mask):
     """点が減ったら、今の PnP 姿勢で歯の上（歯色マスク）から点を取り直して足す（Vacchetti らのオンライン
     キーフレームの簡易版）。既存の生存点の近くは避ける。新しい点の kf_pts（静止判定の基準）はキーフレーム姿勢での投影。"""
     idx = np.where(st["alive"])[0]
-    want = FUSION_PNP_MAX_FEATURES - len(idx)
+    want = FUSION_PNP_MAX_POINTS - len(idx)
     mask = tooth_mask.copy()
+    rad = int(round(_pnp_px(4)))
     for (x, y) in st["cur"][idx]:
-        cv2.circle(mask, (int(round(x)), int(round(y))), 4, 0, -1)
+        cv2.circle(mask, (int(round(x)), int(round(y))), rad, 0, -1)
     pts, X = _pnp_detect(gray, st["R"], st["t"], want, extra_mask=mask)
     if len(pts) == 0:
         return 0
@@ -2007,21 +2091,85 @@ def _pnp_refresh(st, gray, tooth_mask):
     return len(pts)
 
 
-def _pnp_solve(st, X, u, c_prior, iters=8, huber=1.0, R_init=None, t_init=None):
-    """回転＋並進を、再投影誤差（Huber）＋ F 重心の事前分布で解く。戻り値: (R, t, 残差 px, 回転 1σ [deg])。"""
+_PNP_EDGE_CACHE = {}
+
+
+def _pnp_edge_set(key):
+    """歯群 key の稜線（品質評価と同じ draw_vertices / edges）から、端点 A, B と 1 本 3 点の標本点 S を返す（キャッシュ）。"""
+    if key not in _PNP_EDGE_CACHE:
+        a = ANCHOR_BY_KEY[key]
+        V = a["draw_vertices"].astype(np.float64)
+        ia, ib = a["edge_a_idx"], a["edge_b_idx"]
+        sel = np.random.default_rng(0).choice(len(ia), size=min(len(ia), FUSION_PNP_EDGE_MAX_PER_GROUP), replace=False)
+        A, B = V[ia[sel]], V[ib[sel]]
+        tt = np.array([0.25, 0.5, 0.75])
+        S = (A[:, None, :] * (1.0 - tt)[None, :, None] + B[:, None, :] * tt[None, :, None]).reshape(-1, 3)
+        _PNP_EDGE_CACHE[key] = (A, B, S)
+    return _PNP_EDGE_CACHE[key]
+
+
+def _pnp_edge_layers(edge_sets, R, t, Ks):
+    """各標本点で引く向き付き距離マップの層（±1 ビン、品質評価と同じ）。反復ごとに今の姿勢で決めて数値微分中は固定する。"""
+    layers = []
+    for (A, B, S) in edge_sets:
+        d = _pnp_project(B @ R.T + t, Ks) - _pnp_project(A @ R.T + t, Ks)
+        nang = np.mod(np.arctan2(d[:, 1], d[:, 0]) + np.pi / 2.0, np.pi)
+        nb = np.repeat(np.round(nang / (np.pi / EDGE_ORIENT_BINS)).astype(np.int64) % EDGE_ORIENT_BINS, 3)
+        layers.append(np.stack([1 + ((nb + off) % EDGE_ORIENT_BINS) for off in (-1, 0, 1)], axis=1))
+    return layers
+
+
+def _pnp_edge_residual(dist_map, edge_sets, layers, R, t, Ks):
+    """稜線の標本点から画像のエッジまでの向き付き距離（双線形補間、FUSION_PNP_EDGE_MAX_PX で打ち切り）。"""
+    hgt, wid = dist_map.shape[1:3]
+    out = []
+    for (A, B, S), lay in zip(edge_sets, layers):
+        uv = _pnp_project(S @ R.T + t, Ks)
+        x, y = uv[:, 0], uv[:, 1]
+        inb = (x >= 0) & (x < wid - 1) & (y >= 0) & (y < hgt - 1)
+        x0 = np.clip(np.floor(x).astype(np.int64), 0, wid - 2)
+        y0 = np.clip(np.floor(y).astype(np.int64), 0, hgt - 2)
+        fx, fy = (x - x0)[:, None], (y - y0)[:, None]
+        v = (dist_map[lay, y0[:, None], x0[:, None]] * (1 - fx) * (1 - fy)
+             + dist_map[lay, y0[:, None], x0[:, None] + 1] * fx * (1 - fy)
+             + dist_map[lay, y0[:, None] + 1, x0[:, None]] * (1 - fx) * fy
+             + dist_map[lay, y0[:, None] + 1, x0[:, None] + 1] * fx * fy)
+        dmin = np.minimum(v.min(axis=1), FUSION_PNP_EDGE_MAX_PX)
+        out.append(np.where(inb, dmin, FUSION_PNP_EDGE_MAX_PX))
+    return np.concatenate(out) if out else np.zeros(0)
+
+
+def _pnp_solve(st, X, u, c_prior, iters=8, huber=None, R_init=None, t_init=None, edge_ctx=None):
+    """回転＋並進を、再投影誤差（Huber）＋ F 重心の事前分布（＋ edge_ctx があれば見えている歯の輪郭）で解く。
+    edge_ctx = (向き付きエッジ距離マップ, 歯群キーのリスト)。戻り値: (R, t, 残差 px, 回転 1σ [deg])。"""
+    if huber is None:
+        huber = _pnp_px(1.0)
+    if FUSION_PNP_SCALE != QUALITY_SCALE:
+        edge_ctx = None                       # 輪郭の距離マップは品質評価の縮尺なので、倍率が違うときは使わない
     Ks = st["Ks"]
     cF = ANCHOR_BY_KEY["F"]["centroid"].astype(np.float64)
     w_prior = 1.0 / FUSION_PNP_PRIOR_SIGMA_M      # 重心 1σ のずれ ≒ 再投影 1 px と同じ重み
     R = (st["R"] if R_init is None else R_init).copy()
     t = (st["t"] if t_init is None else t_init).copy()
+    edge_sets, dist_map, w_edge = [], None, 0.0
+    if edge_ctx is not None and FUSION_PNP_USE_EDGES and edge_ctx[0] is not None and edge_ctx[1]:
+        dist_map = edge_ctx[0]
+        edge_sets = [_pnp_edge_set(k) for k in edge_ctx[1] if k in ANCHOR_BY_KEY]
+        n_edge = sum(len(s[2]) for s in edge_sets)
+        # 輪郭の二乗和 ≈ 特徴点の二乗和 × FUSION_PNP_EDGE_REL になる重み（特徴点は 1 点 2 成分）
+        w_edge = FUSION_PNP_EDGE_REL * np.sqrt(2.0 * max(len(X), 10) / max(n_edge, 1))
+    layers = None
 
     def residual(Rm, tv):
         rp = (_pnp_project(X @ Rm.T + tv, Ks) - u).ravel()
         rc = ((Rm @ cF + tv) - c_prior) * w_prior if c_prior is not None else np.zeros(0)
-        return rp, rc
+        re = _pnp_edge_residual(dist_map, edge_sets, layers, Rm, tv, Ks) * w_edge if edge_sets else np.zeros(0)
+        return rp, np.concatenate([rc, re])
 
     J = None
     for _ in range(iters):
+        if edge_sets:
+            layers = _pnp_edge_layers(edge_sets, R, t, Ks)
         rp, rc = residual(R, t)
         r = np.concatenate([rp, rc])
         J = np.zeros((len(r), 6))
@@ -2062,18 +2210,21 @@ def pnp_output_pose(st, R_out):
     return out
 
 
-def pnp_track(st, gray, c_prior, bgr=None):
+def pnp_track(st, gray, c_prior, bgr=None, edge_ctx=None):
     """キーフレーム特徴点を前フレームから LK で追い（前後追跡チェック）、姿勢を解く。bgr があれば点の補充に使う。
-    戻り値 dict: ok, still（静止判定）, R, n, std_deg, res_px, deg（キーフレームからの回転）, disp_px, added。"""
+    edge_ctx = (向き付きエッジ距離マップ, 見えている歯群のキー) を渡すと、その歯の輪郭も一緒に使って解く（⑧）。
+    戻り値 dict: ok, still（静止判定）, R, n, std_deg, res_px, deg（キーフレームからの回転）, disp_px, added, edge_q。"""
     idx = np.where(st["alive"])[0]
     out = {"ok": False, "still": False, "n": int(len(idx)), "std_deg": float("nan"), "res_px": float("nan"),
            "deg": float("nan"), "disp_px": float("nan"), "R": None, "added": 0}
     if len(idx) < FUSION_PNP_MIN_POINTS:
         return out
     p0 = st["cur"][idx]
-    p1, s1, _ = cv2.calcOpticalFlowPyrLK(st["gray"], gray, p0, None, winSize=(21, 21), maxLevel=3)
-    pb, s2, _ = cv2.calcOpticalFlowPyrLK(gray, st["gray"], p1, None, winSize=(21, 21), maxLevel=3)
-    good = (s1.ravel() == 1) & (s2.ravel() == 1) & (np.linalg.norm(pb - p0, axis=1) < FUSION_PNP_FB_MAX_PX)
+    win = (min(_pnp_odd(21), 31),) * 2
+    lvl = 3 + int(FUSION_PNP_PX > 1.5)        # 元の解像度では動きの px も倍になるのでピラミッドを 1 段増やす
+    p1, s1, _ = cv2.calcOpticalFlowPyrLK(st["gray"], gray, p0, None, winSize=win, maxLevel=lvl)
+    pb, s2, _ = cv2.calcOpticalFlowPyrLK(gray, st["gray"], p1, None, winSize=win, maxLevel=lvl)
+    good = (s1.ravel() == 1) & (s2.ravel() == 1) & (np.linalg.norm(pb - p0, axis=1) < _pnp_px(FUSION_PNP_FB_MAX_PX))
     st["alive"][idx[~good]] = False
     st["cur"][idx[good]] = p1[good]
     st["gray"] = gray
@@ -2089,29 +2240,53 @@ def pnp_track(st, gray, c_prior, bgr=None):
     if len(idx) < FUSION_PNP_MIN_POINTS:
         return out
     # ① 静止判定（ZUPT）: 大多数の点がキーフレームから動いていなければ、模型は動いていない
-    out["disp_px"] = float(np.median(np.linalg.norm(st["cur"][idx] - st["kf_pts"][idx], axis=1)))
-    if out["disp_px"] < FUSION_PNP_STILL_PX:
+    disp = np.linalg.norm(st["cur"][idx] - st["kf_pts"][idx], axis=1)
+    out["disp_px"] = float(np.median(disp))
+    if out["disp_px"] < _pnp_px(FUSION_PNP_STILL_PX):
+        # ⑩(a) 模型が止まっているのに動いている点は、手などに引きずられた点
+        moving = disp >= _pnp_px(FUSION_PNP_STILL_DROP_PX)
+        if FUSION_PNP_STILL_DROP_PX > 0 and moving.any():
+            st["alive"][idx[moving]] = False
+            out["still_drop"] = int(moving.sum())
+            out["n"] = int(np.count_nonzero(st["alive"]))
         st["R"], st["t"] = st["R0"].copy(), st["t0"].copy()
         out.update(ok=True, still=True, R=st["R0"].copy(), deg=0.0, std_deg=0.0, res_px=0.0)
         return out
     # ② 前回の解とキーフレーム姿勢の両方から解き、1 px 以内に乗る点が多い方を採る
     X_, u_ = st["X"][idx], st["cur"][idx].astype(np.float64)
-    cands = [_pnp_solve(st, X_, u_, c_prior),
-             _pnp_solve(st, X_, u_, c_prior, R_init=st["R0"], t_init=st["t0"])]
-    R, t, res, std = max(cands, key=lambda c: (int(np.count_nonzero(c[2] < 1.0)), -float(np.median(c[2]))))
-    inl = res < FUSION_PNP_OUTLIER_PX
+    cands = [_pnp_solve(st, X_, u_, c_prior, edge_ctx=edge_ctx),
+             _pnp_solve(st, X_, u_, c_prior, R_init=st["R0"], t_init=st["t0"], edge_ctx=edge_ctx)]
+    R, t, res, std = max(cands, key=lambda c: (int(np.count_nonzero(c[2] < _pnp_px(1.0))), -float(np.median(c[2]))))
+    inl = res < _pnp_px(FUSION_PNP_OUTLIER_PX)
+    out["inlier_frac"] = float(inl.mean())
+    if inl.mean() < FUSION_PNP_MIN_INLIER_FRAC:
+        # ⑩(b) 一部の点にしか合わない解は、手などの少数派に合わせた解の疑い → 採らない（点も捨てない）
+        out.update(std_deg=std, res_px=float(np.median(res)),
+                   deg=float(np.degrees(np.linalg.norm(cv2.Rodrigues(R @ st["R0"].T)[0]))))
+        return out
     if FUSION_PNP_MIN_POINTS <= inl.sum() < len(idx):
         st["alive"][idx[~inl]] = False                 # 剛体運動に合わない点（手・反射）は以後使わない
         idx = idx[inl]
-        R, t, res, std = _pnp_solve(st, st["X"][idx], st["cur"][idx].astype(np.float64), c_prior, R_init=R, t_init=t)
+        R, t, res, std = _pnp_solve(st, st["X"][idx], st["cur"][idx].astype(np.float64), c_prior, R_init=R, t_init=t,
+                                    edge_ctx=edge_ctx)
     out.update(n=int(len(idx)), std_deg=std, res_px=float(np.median(res)),
                deg=float(np.degrees(np.linalg.norm(cv2.Rodrigues(R @ st["R0"].T)[0]))))
-    if len(idx) >= FUSION_PNP_MIN_POINTS and out["res_px"] <= FUSION_PNP_MAX_RES_PX and std <= FUSION_PNP_MAX_STD_DEG:
+    # ⑧ その姿勢で、見えている歯群の輪郭が画像のエッジに乗っている割合（品質評価と同じ尺度）
+    edge_q = None
+    if edge_ctx is not None and edge_ctx[0] is not None and edge_ctx[1]:
+        _P = np.eye(4, dtype=np.float32)
+        _P[:3, :3], _P[:3, 3] = R, t
+        edge_q = float(np.mean([estimate_anchor_quality(edge_ctx[0], _P, ANCHOR_BY_KEY[k])
+                                for k in edge_ctx[1] if k in ANCHOR_BY_KEY]))
+    out["edge_q"] = edge_q
+    if len(idx) >= FUSION_PNP_MIN_POINTS and out["res_px"] <= _pnp_px(FUSION_PNP_MAX_RES_PX) and std <= FUSION_PNP_MAX_STD_DEG:
         st["R"], st["t"] = R, t
         out.update(ok=True, R=R)
         # ⑤ 点が減っていて解が十分よいときは、今の姿勢で歯の上から点を補充する
+        #   （⑧ 見えている歯の輪郭が合っていない姿勢では補充しない。ずれた姿勢で点を結び付けるとずれが固まる）
         if (bgr is not None and len(idx) < FUSION_PNP_REFRESH_BELOW
-                and out["res_px"] <= FUSION_PNP_REFRESH_MAX_RES_PX):
+                and out["res_px"] <= _pnp_px(FUSION_PNP_REFRESH_MAX_RES_PX)
+                and (edge_q is None or edge_q >= FUSION_PNP_REFRESH_MIN_EDGE_Q)):
             small = cv2.resize(bgr, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_AREA)
             out["added"] = _pnp_refresh(st, gray, compute_tooth_mask(small).astype(np.uint8) * 255)
     return out
@@ -2741,6 +2916,11 @@ fusion_rot_motion_until = 0.0          # この時刻までは「模型が動い
 fusion_rot_motion_px = None            # 今フレームの基準からの移動量 [px, 縮小画像]（CSV 用）
 pnp_last_good = None                   # 直近の F 良好フレーム (縮小グレー, F 姿勢, 時刻)。遮蔽が始まったらキーフレームにする
 pnp_f_since = None                     # F で出力し始めた時刻（統合中は None）。戻った直後の F はキーフレームにしない
+f_guard = None                         # ⑥ F 追跡中の見張り用キーフレーム特徴点 PnP（pnp_keyframe_begin の戻り値）
+f_guard_time = 0.0                     # その作成時刻
+f_guard_streak = 0                     # F が PnP から離れている連続フレーム数
+fusion_pnp_bad_since = None            # ⑦ 統合中に PnP が使えなくなった時刻（使えていれば None）
+fusion_stuck_relock_time = 0.0         # ⑦ 最後に抜け出せない状態から再ロックした時刻
 fusion_pnp = None                      # 統合中のキーフレーム特徴点 PnP の状態（pnp_keyframe_begin の戻り値）
 fusion_pnp_info = None                 # 今フレームの PnP 結果（CSV 用）
 fusion_rot_streak = {}                 # 歯群ごとの「回転源の条件を満たした連続フレーム数」
@@ -3480,8 +3660,9 @@ while True:
     _pf_mark("marker")
     frame_idx += 1
 
-    send_video_frame_to_unity(frame_img)
-    _pf_mark("video")
+    # 映像は姿勢と同時に送る（ループの最後、send_pose_to_unity の直前）。以前はここで送っていて、Unity には
+    # 新しい映像が先に届き、その映像の姿勢は追跡・品質評価の後（約 50 ms 後）に届くので、動かすとモデルが映像より
+    # 1 フレーム遅れて見えた（2026-10-20 「動かすと追従が遅れる」）。
     poll_unity_commands(frame_img)
     _pf_mark("poll")
 
@@ -3691,7 +3872,54 @@ while True:
             if (FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp" and not fusion_off_f
                     and time.time() - pnp_f_since >= FUSION_PNP_KEYFRAME_MIN_F_SEC
                     and quality_by_key.get("F", 0.0) >= FUSION_PNP_KEYFRAME_MIN_QF):
-                pnp_last_good = (_motion_gray(frame_img), poses_by_key["F"].copy(), time.time())
+                pnp_last_good = (_pnp_gray(frame_img), poses_by_key["F"].copy(), time.time())
+
+            # ⑥ F 追跡中の見張り: 特徴点 PnP と F が大きく食い違い続けたら F を PnP の姿勢へ戻す
+            if F_GUARD_ENABLED and not fusion_off_f:
+                _now_g = time.time()
+                _gray_g = _pnp_gray(frame_img)
+                _fpose = poses_by_key["F"]
+                _qf_g = quality_by_key.get("F", 0.0)
+                _f_long = pnp_f_since is not None and _now_g - pnp_f_since >= F_GUARD_MIN_F_SEC
+                _rekey = f_guard is None
+                if f_guard is not None:
+                    _gi = pnp_track(f_guard, _gray_g, None, bgr=frame_img)
+                    if _gi["ok"] and _gi["n"] >= F_GUARD_MIN_POINTS and _gi["res_px"] <= _pnp_px(F_GUARD_MAX_RES_PX):
+                        _P = pnp_output_pose(f_guard, f_guard["R"])
+                        _d_mm = float(np.linalg.norm(_group_center_cam("F", _fpose) - _group_center_cam("F", _P))) * 1000.0
+                        _d_deg = rotation_angle_deg(_fpose, _P)
+                        if _d_mm > F_GUARD_DIVERGE_MM or _d_deg > F_GUARD_DIVERGE_DEG:
+                            f_guard_streak += 1
+                        else:
+                            f_guard_streak = 0
+                        if f_guard_streak >= F_GUARD_DIVERGE_FRAMES:
+                            print(f"F の見張り: F が特徴点 PnP から {_d_mm:.0f} mm / {_d_deg:.0f}° 離れた"
+                                  f"（{f_guard_streak} フレーム、qF={_qf_g:.2f}）→ PnP の姿勢へ戻す")
+                            reset_all_anchors(_P)
+                            poses_by_key = {k: _P.copy() for k in poses_by_key}
+                            pose = poses_by_key[active_anchor]
+                            quality_by_key = {a["key"]: estimate_anchor_quality(dist_map, poses_by_key[a["key"]], a)
+                                              for a in ANCHORS}
+                            prev_output_pose = None          # 戻した姿勢を跳び量ゲートが「跳び」として戻さないように
+                            pose_vel_t = np.zeros(3)
+                            pose_vel_rv = np.zeros(3)
+                            frame_event = f"f_guard_reset {_d_mm:.0f}mm/{_d_deg:.0f}deg"
+                            f_guard_streak = 0
+                        elif (_d_mm <= F_GUARD_AGREE_MM and _d_deg <= F_GUARD_AGREE_DEG and _qf_g >= F_GUARD_MIN_QF
+                              and _now_g - f_guard_time >= F_GUARD_REKEY_SEC):
+                            _rekey = True
+                    else:
+                        f_guard_streak = 0
+                        # 見張りが使えない（点不足・残差大）まま F が良好なら取り直す
+                        _rekey = _qf_g >= F_GUARD_MIN_QF and _now_g - f_guard_time >= F_GUARD_REKEY_SEC
+                if _rekey and _f_long and _qf_g >= F_GUARD_MIN_QF:
+                    f_guard = pnp_keyframe_begin(_gray_g, poses_by_key["F"])
+                    f_guard_time = _now_g
+                    f_guard_streak = 0
+            elif fusion_off_f:
+                f_guard = None
+                f_guard_streak = 0
+            _pf_mark("f_guard")
 
             last_anchor_quality = dict(quality_by_key)
 
@@ -3827,6 +4055,7 @@ while True:
                         fusion_rot_streak = {}
                         fusion_rot_prev_R = {}
                         fusion_pnp = None
+                        fusion_pnp_bad_since = None
                         if (FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp" and pnp_last_good is not None
                                 and now_t - pnp_last_good[2] <= FUSION_PNP_KEYFRAME_MAX_AGE_SEC):
                             fusion_pnp = pnp_keyframe_begin(pnp_last_good[0], pnp_last_good[1])
@@ -3879,6 +4108,7 @@ while True:
                         fusion_rot_motion_ref = None
                         fusion_rot_motion_until = 0.0
                         fusion_pnp = None
+                        fusion_pnp_bad_since = None
                         if _do_search:
                             # ① 候補はこの場では評価しない（1 フレーム 450 ms 止まる）。画像を控えて次フレームから分割評価する
                             return_search_job = return_search_begin(frame_img, dist_map, poses_by_key["F"], _occl_text)
@@ -3972,7 +4202,8 @@ while True:
                                 _c_prior = _group_center_cam("F", prev_output_pose)
                             else:
                                 _c_prior = None
-                            fusion_pnp_info = pnp_track(fusion_pnp, _motion_gray(frame_img), _c_prior, bgr=frame_img)
+                            fusion_pnp_info = pnp_track(fusion_pnp, _pnp_gray(frame_img), _c_prior, bgr=frame_img,
+                                                        edge_ctx=(dist_map, list(sane)) if (sane and FUSION_PNP_USE_EDGES) else None)
                             R_target = None
                             if not fusion_pnp_info["ok"]:
                                 rot_src_now = "PNP(bad)"          # 解を信用できない → 回転は今のまま
@@ -4046,6 +4277,8 @@ while True:
                     fusion_rot_src = rot_src_now
                     _pnp_trans_ok = (FUSION_PNP_USE_TRANSLATION and fusion_pnp is not None
                                      and fusion_pnp_info is not None and fusion_pnp_info["ok"])
+                    _pnp_alive = fusion_pnp is not None and fusion_pnp_info is not None and fusion_pnp_info["ok"]
+                    fusion_pnp_bad_since = None if _pnp_alive else (fusion_pnp_bad_since or now_t)
                     if sane:
                         fusion_no_member_since = None
                         fused = _fuse_groups(sane, poses_by_key, fusion_rot_ref)
@@ -4296,6 +4529,25 @@ while True:
                 print(f"自動姿勢登録: スロット{target_slot}に保存"
                       f"（アンカー{active_anchor}, quality={last_quality:.2f}、"
                       f"良品質が{AUTO_CAPTURE_MIN_GOOD_STREAK}フレーム継続）")
+
+            # ⑦ 統合から抜け出せない状態: 歯は見えているのに PnP が使えず、F も戻れないまま統合が続いている
+            if (FUSION_STUCK_RELOCK and fusion_off_f and anchor_switch_pose is not None and not force_relock
+                    and fusion_pnp_bad_since is not None):
+                _now_s = time.time()
+                _qA, _qB = quality_by_key.get("A", 0.0), quality_by_key.get("B", 0.0)
+                if (_now_s - anchor_switch_time >= FUSION_STUCK_MIN_FUSION_SEC
+                        and _now_s - fusion_pnp_bad_since >= FUSION_STUCK_PNP_BAD_SEC
+                        and _qA >= FUSION_STUCK_GROUP_Q and _qB >= FUSION_STUCK_GROUP_Q
+                        and quality_by_key.get("F", 0.0) < ANCHOR_F_RECOVER_QUALITY
+                        and _now_s - fusion_stuck_relock_time >= FUSION_STUCK_COOLDOWN_SEC):
+                    print(f"統合から抜け出せない: 統合 {_now_s - anchor_switch_time:.0f} s・PnP なし "
+                          f"{_now_s - fusion_pnp_bad_since:.0f} s、A={_qA:.2f} B={_qB:.2f} は見えているのに "
+                          f"F={quality_by_key.get('F', 0.0):.2f} が戻らない → 全探索で再ロック")
+                    force_relock = True
+                    relock_fail_count = max(relock_fail_count, 1)   # 0 だと直前の良好姿勢の近く（回転制限）だけを探す
+                    relock_fail_count = min(relock_fail_count, RELOCK_FAILS_BEFORE_SEARCH - 1)
+                    fusion_stuck_relock_time = _now_s
+                    frame_event = (frame_event + ";" if frame_event else "") + "fusion_stuck_relock"
 
             if QUALITY_CHECK_ENABLED:
                 now = time.time()
@@ -4561,6 +4813,8 @@ while True:
         mode_text = "ADJUST"
         display_pose = pose
 
+    send_video_frame_to_unity(frame_img)   # このフレームの姿勢と組で送る（上の poll_unity_commands の前のコメント参照）
+    _pf_mark("video")
     send_pose_to_unity(display_pose, mode_text)
 
     cv2.putText(show, f"MODE: {mode_text}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
