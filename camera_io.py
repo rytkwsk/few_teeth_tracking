@@ -4,7 +4,10 @@
 tracker_four_group.py / tools/calibrate_camera.py / tools/list_cameras.py から使う。
 
 設定の優先順位: プロセスの環境変数 > m3t_local.env（リポジトリ直下、gitignore）> 既定値
-  M3T_CAMERA_INDEX    カメラ番号（既定 0）。Mac の連係カメラ（iPhone）は 0 とは限らないので tools/list_cameras.py で確かめる
+  M3T_CAMERA_INDEX    カメラ番号。Mac の連係カメラ（iPhone）は 0 とは限らないので tools/list_cameras.py で確かめる。
+                      未設定のとき Windows（dshow）は M3T_CAMERA_NAME の名前で探し、見つからなければ 0、他の OS は 0
+  M3T_CAMERA_NAME     Windows で番号を名前（部分一致、大小無視）で探すときの名前（既定 iVCam。pygrabber を使う）。
+                      DirectShow の番号は PC・接続状況で変わる（OMEN では内蔵カメラと iVCam の番号が入れ替わった）
   M3T_CAMERA_BACKEND  dshow / msmf / avfoundation / v4l2 / any（既定: Windows=dshow, Mac=avfoundation, 他=any）
   M3T_CAMERA_WIDTH    要求する幅（既定 1280）。キャリブ（camera_calibration.npz）の解像度と一致させること
   M3T_CAMERA_HEIGHT   要求する高さ（既定 720）
@@ -64,10 +67,33 @@ def camera_backend():
 
 
 def camera_index(default=0):
+    value = os.environ.get("M3T_CAMERA_INDEX", "").strip()
+    if value:
+        try:
+            return int(value)
+        except ValueError:
+            print(f"M3T_CAMERA_INDEX={value} は数字でないので無視する")
+    if camera_backend()[0] == "dshow":
+        found = _find_dshow_index_by_name(os.environ.get("M3T_CAMERA_NAME", "iVCam"))
+        if found is not None:
+            return found
+    return default
+
+
+def _find_dshow_index_by_name(name):
+    """DirectShow の入力デバイス一覧から名前を含む最初の番号を返す。一覧が取れない／見つからなければ None。"""
     try:
-        return int(os.environ.get("M3T_CAMERA_INDEX", default))
-    except ValueError:
-        return default
+        from pygrabber.dshow_graph import FilterGraph
+        devices = FilterGraph().get_input_devices()
+    except Exception as e:  # noqa: BLE001
+        print(f"カメラ一覧を取得できない（{e}）→ M3T_CAMERA_INDEX か既定の番号を使う")
+        return None
+    for index, device in enumerate(devices):
+        if name.lower() in device.lower():
+            print(f"カメラ: {index} 番 '{device}' を使用（M3T_CAMERA_NAME='{name}'）")
+            return index
+    print(f"カメラ: '{name}' が見つからない。一覧: {list(enumerate(devices))}")
+    return None
 
 
 def camera_size(default=(1280, 720)):
