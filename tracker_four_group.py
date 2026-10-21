@@ -387,7 +387,9 @@ FUSION_PNP_FB_MAX_PX     = 0.8     # 前後追跡の往復誤差（縮小画像 
 # ⑤ 点の補充（11:50 run）: 遮蔽中に奥行き方向へ動かすと点が 1.5 s で 43→11 と減り PnP(bad) → 歯群重心（奥行き固定）に
 #   戻って追えなかった（142.5 s: 真値 −13.6 mm に対し出力 +9.2 mm）。生存点がこれ未満になったら、解が信用できる
 #   （残差中央値 ≤ FUSION_PNP_REFRESH_MAX_RES_PX）ときに今の姿勢で歯色の画素から点を取り直して足す。
-FUSION_PNP_REFRESH_BELOW     = 40
+# ㉒ 2026-10-21 17:47 デモ撮影: 遮蔽中に回すと点は 303 → 35° で 33 まで減り続けた（残差 1 px 超えで補充されないまま 40 を割り、
+#   PnP が bad に）。早めに（解がまだ 1 mm・2° で合っているうちに）補充する値を M3T_FUSION_PNP_REFRESH_BELOW で試す。
+FUSION_PNP_REFRESH_BELOW     = int(os.environ.get("M3T_FUSION_PNP_REFRESH_BELOW", "40"))
 FUSION_PNP_REFRESH_MAX_RES_PX = 1.0
 # ⑧ 見えている歯の輪郭を特徴点と一緒に使う（2026-10-20 20:01 run、Choi & Christensen IJRR 2012 のキーポイント＋エッジの考え方）:
 #   遮蔽中に 25〜35° 回すと、歯の上の特徴点が 35〜39 まで減り、補充のたびに今のずれた姿勢で点を結び付けるので回転の取りこぼし
@@ -508,6 +510,11 @@ if _pnp_axis_env:
 # 遮蔽直前の F 良好フレームがこれより古ければキーフレームにしない（1.0→3.0: 11:43 run で遮蔽の合間の F が 0.04〜0.8 s と
 # 短く、一瞬 F に戻ってから遮蔽が始まると 1 s を超えて 20 区間中 9 区間でキーフレームが作れず回転を保持した）
 FUSION_PNP_KEYFRAME_MAX_AGE_SEC = 3.0
+# ㉓ 2026-10-21 18:09 デモ撮影: 遮蔽なしで 30° 以上回すと F の適合度が 0.45〜0.50 に下がって良好フレームが控えられず、
+#   統合に入ったときに 1.8 s 前（その間に 9° 回っていた）のフレームをキーフレームにした。LK が 30 px 以上の跳びを追えず
+#   最初から PnP(bad) → 保持のまま回り続けて 8 mm / 8.5° → 再ロックが 30 mm に誤ロック。良好フレームがこの秒数より古く、
+#   F の見張りが点を追えているときは見張りの点を引き継ぐ（⑮ と同じ経路）。M3T_PNP_PREFER_GUARD_AGE=0 で従来。
+FUSION_PNP_PREFER_GUARD_AGE_SEC = float(os.environ.get("M3T_PNP_PREFER_GUARD_AGE", "0"))
 FUSION_PNP_KEYFRAME_MIN_QF = 0.50       # 15:24 run の F 追跡中 qF は中央値 0.57 / p10 0.35
 # F に戻った直後は姿勢が収束しきっておらず、11:35 run では 9〜15° ずれた F をキーフレームにして次の遮蔽区間に誤差を
 # 引き継いだ（90.5 s・31.1 s の区間、復帰 0.26 s 後に次の遮蔽）。F で連続してこの秒数以上追跡できたフレームだけを
@@ -530,6 +537,18 @@ FUSION_PNP_KEYFRAME_GUARD_MM  = float(os.environ.get("M3T_FUSION_PNP_KEY_GUARD_M
 #   M3T_PNP_DEFER_RELOCK=0 で従来。
 FUSION_PNP_DEFER_RELOCK  = os.environ.get("M3T_PNP_DEFER_RELOCK", "1") != "0"
 FUSION_PNP_DEFER_MAX_SEC = 30.0
+# ⑳ ⑫ の続き（2026-10-21 17:38 デモ撮影）: 待たせた「品質低下」の連続数は統合中も積み上がったままなので、統合解除 → F の
+#   そのフレームで再ロックが走っていた（4 回とも復帰の直後。PnP は 0.8 mm / 3°、F も 2° で合っていたのに、手が去りきらない画像で
+#   選んだ候補が 10 mm / 23°、続く全探索で 17 mm。1 回 0.8 s 止まるのが「たまにラグい」の正体）。PnP が解けたまま戻ったときは
+#   見失っていないので、品質低下の連続数を数え直す（F が本当に悪ければ HOLD_BEFORE_RECOVERY_SEC 後に従来どおり再ロック）。
+#   M3T_RETURN_RESET_LOST=0 で従来。
+FUSION_RETURN_RESET_LOST = os.environ.get("M3T_RETURN_RESET_LOST", "1") != "0"
+# ㉑ ⑫ の猶予（2026-10-21 17:47 デモ撮影）: 遮蔽中に 35° 回したところで PnP が 1 フレームだけ bad になり、その同じフレームで
+#   再ロックが走った（直前の PnP は 1.3 mm / 1.8°、手が乗ったままの探索は 20 mm / 16°、1.4 s 停止）。PnP が bad になってから
+#   この秒数は「まだ保持できている」とみなして待つ（出力は直前の PnP の姿勢）。M3T_PNP_BAD_GRACE_SEC=0 で従来。
+FUSION_PNP_BAD_GRACE_SEC = float(os.environ.get("M3T_PNP_BAD_GRACE_SEC", "1.5"))
+# ㉔ 遮蔽中に PnP が解けている間は、品質が低くても Unity へ送る姿勢を最後の良好姿勢で止めない。M3T_DISPLAY_FOLLOW_PNP=0 で従来。
+DISPLAY_FOLLOW_PNP = os.environ.get("M3T_DISPLAY_FOLLOW_PNP", "1") != "0"
 # ⑬ 統合中の F の試走（2026-10-21 録画の再生で評価）: 統合中は全アンカーを毎フレーム出力姿勢へ戻していたので、出力が 5〜8° ずれた
 #   まま手を離しても F は 1 step しか進めず q が 0.42〜0.50 から上がらず、F への復帰に 1.2〜3.4 s かかった（その間ずれたまま）。
 #   統合中は F だけ出力へ戻さずに追わせ、出力から F_FREE_MAX_MM / _DEG 以上離れたら出力へ戻す。M3T_F_FREE=1 で有効。
@@ -4443,8 +4462,13 @@ while True:
                         if _from_guard and FUSION_DEPART_FROM_GUARD == 1 and FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp":
                             fusion_pnp = f_guard          # ⑰ 離脱時の姿勢を出した見張りの点をそのまま使う
                             print("統合: 離脱時の姿勢・回転源 PnP とも F の見張りから")
+                        _guard_usable = (FUSION_PNP_FROM_GUARD and f_guard is not None
+                                         and int(np.count_nonzero(f_guard["alive"])) >= FUSION_PNP_MIN_POINTS)
                         if (fusion_pnp is None and FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp" and pnp_last_good is not None
-                                and now_t - pnp_last_good[2] <= FUSION_PNP_KEYFRAME_MAX_AGE_SEC):
+                                and now_t - pnp_last_good[2] <= FUSION_PNP_KEYFRAME_MAX_AGE_SEC
+                                # ㉓ 古い良好フレームより、今まで追えている見張りの点を優先する
+                                and not (FUSION_PNP_PREFER_GUARD_AGE_SEC > 0 and _guard_usable
+                                         and now_t - pnp_last_good[2] > FUSION_PNP_PREFER_GUARD_AGE_SEC)):
                             fusion_pnp = pnp_keyframe_begin(pnp_last_good[0], pnp_last_good[1], pnp_last_good[2])
                         if (fusion_pnp is None and FUSION_PNP_FROM_GUARD and FUSION_ROT_FROM_GROUP
                                 and FUSION_ROT_SOURCE == "pnp" and f_guard is not None and len(f_guard["X"]) >= FUSION_PNP_MIN_POINTS):
@@ -4485,6 +4509,12 @@ while True:
                         _warn_rot = _occl_sec >= ROT_UNCERTAIN_AFTER_SEC or _occl_moved >= ROT_UNCERTAIN_MOVE_M
                         _do_search = (RETURN_ROT_SEARCH_ENABLED
                                       and (_occl_sec >= RETURN_ROT_SEARCH_MIN_OCCL_SEC or _occl_moved >= RETURN_ROT_SEARCH_MIN_MOVE_M))
+                        if (FUSION_RETURN_RESET_LOST and fusion_pnp is not None
+                                and (fusion_pnp_bad_since is None or now_t - fusion_pnp_bad_since < FUSION_PNP_BAD_GRACE_SEC)):
+                            # ⑳ PnP で保持していた間の「品質低下」は見失いではないので、復帰した F で数え直す
+                            lost_streak = 0
+                            lost_start_time = None
+                            quality_smoothed = max(quality_smoothed, qF_)
                         fusion_off_f = False
                         fusion_active = False
                         fusion_keys = []
@@ -4975,7 +5005,8 @@ while True:
                                     and now - lost_start_time >= HOLD_BEFORE_RECOVERY_SEC)
                 # ⑫ 遮蔽中で PnP が解けている間は見失っていない（出力は PnP で保持）→ 品質低下での再ロックは待つ
                 pnp_holding = (FUSION_PNP_DEFER_RELOCK and fusion_off_f and fusion_pnp is not None
-                               and fusion_pnp_bad_since is None and anchor_switch_pose is not None
+                               and (fusion_pnp_bad_since is None or now - fusion_pnp_bad_since < FUSION_PNP_BAD_GRACE_SEC)   # ㉑
+                               and anchor_switch_pose is not None
                                and now - anchor_switch_time < FUSION_PNP_DEFER_MAX_SEC)
                 if force_relock or (lost_streak >= QUALITY_LOSS_CONSECUTIVE and held_long_enough and not pnp_holding
                                     and now - last_recovery_time >= RECOVERY_COOLDOWN_SEC):
@@ -5202,8 +5233,13 @@ while True:
         # 品質が悪いフレームは last_good_pose を送り続け、Unity 側のモデルが
         # 飛ばないようにする（この判定はプレビュー表示や FIT QUALITY 自体には
         # 影響しない。送信内容だけをフリーズさせる）。
+        # ㉔ 遮蔽中に PnP が解けている間は見失っていない（⑫ と同じ判定）。品質は F の適合度に引きずられて 0.4 を割るが、
+        #   ここで止めると模型を動かしても輪郭が遮蔽前の位置に残り、品質が戻った瞬間に跳ぶ（2026-10-21 18:25 デモ撮影:
+        #   出力は ArUco 比 0.2〜1.0 mm なのに表示は 13 mm 手前で止まっていた。遮蔽中の 11〜25% のフレーム）
+        _pnp_live = (DISPLAY_FOLLOW_PNP and fusion_off_f and fusion_pnp is not None
+                     and (fusion_pnp_bad_since is None or time.time() - fusion_pnp_bad_since < FUSION_PNP_BAD_GRACE_SEC))
         pose_to_smooth = pose
-        if last_good_pose is not None and last_quality < QUALITY_LOSS_THRESHOLD:
+        if last_good_pose is not None and last_quality < QUALITY_LOSS_THRESHOLD and not _pnp_live:
             pose_to_smooth = last_good_pose
         display_pose = smooth_pose(pose_to_smooth)
     else:
