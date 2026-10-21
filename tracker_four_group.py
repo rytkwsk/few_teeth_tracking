@@ -475,6 +475,18 @@ FUSION_PNP_ONLY = os.environ.get("M3T_FUSION_PNP_ONLY", "0") == "1"
 FUSION_PNP_ANCHORS = os.environ.get("M3T_FUSION_PNP_ANCHORS", "0") == "1"
 FUSION_PNP_ANCHOR_Q = float(os.environ.get("M3T_FUSION_PNP_ANCHOR_Q", "0.55"))
 FUSION_PNP_ANCHOR_MIN_POINTS = 30
+# ㉕ アンカーの採用にヒステリシス（2026-10-21 18:49 デモ撮影）: 小臼歯（B）を手で覆うと A の適合度が 0.21〜0.35 で θG = 0.25 を
+#   毎フレームまたぎ、A+D の約 200 点（1〜2.5 mm）と D だけの約 60 点（前歯は小さく片側なので 5.5〜7.8 mm）が交互に入れ替わって
+#   輪郭がガタつき、ずれた。一度使い始めた歯群はこの値を割るまで外さない。既定は FUSION_PNP_ANCHOR_Q と同じ（ヒステリシスなし）。
+# ㉖ 2026-10-21 19:32 デモ撮影: PnP が効いている最中に「使える歯群なし」（部分モデルの統合の条件）と F 0.45〜0.48 で F へ戻り、
+#   すぐ統合に入り直して良好フレームがなくキーフレームが作れず PNP(none) → 回転を止めたまま 16° ずれた。PnP が解けている間は
+#   この経路で戻らない（全歯群が見える・F が F_RECOVER_Q 以上で 2 s の経路は従来どおり）。M3T_FUSION_KEEP_PNP=1 で有効。
+FUSION_KEEP_PNP_NO_MEMBER = os.environ.get("M3T_FUSION_KEEP_PNP", "0") == "1"
+# ㉗ 2026-10-21 20:34 デモ撮影: 遮蔽中に 30° 回して F に戻ったが F の適合度が 0.41〜0.43（「良好」0.46 未満）で last_good_pose が
+#   回す前のまま残り、1.1 s 後に統合へ入ったときその姿勢から始めて 28 mm / 30° 一瞬で戻った。last_good_pose がこの秒数より古ければ
+#   前フレームの出力姿勢を離脱時の姿勢にする。M3T_DEPART_STALE_SEC=0 で従来。
+FUSION_DEPART_STALE_SEC = float(os.environ.get("M3T_DEPART_STALE_SEC", "0"))
+FUSION_PNP_ANCHOR_Q_OFF = float(os.environ.get("M3T_FUSION_PNP_ANCHOR_Q_OFF", str(FUSION_PNP_ANCHOR_Q)))
 F_GUARD_MAX_RES_PX     = 1.0
 # ⑦ 統合から抜け出せない状態の検知（2026-10-20 19:47 run）: 遮蔽中に回して回転が 17.6° ずれたまま PnP の点が 0 になり、
 #   手を離して A/B は q 0.7 で見えているのに、F は出力（ずれた姿勢）へ毎フレーム同期されるので q 0.52〜0.55 から上がらず
@@ -3120,6 +3132,7 @@ fusion_rot_total_deg = 0.0             # 離脱時の回転からの累計回転
 fusion_rot_motion_ref = None           # 回転追従の動き検出の基準（motion_ref_begin の戻り値）
 fusion_rot_motion_until = 0.0          # この時刻までは「模型が動いた」とみなして回転追従を許す
 fusion_rot_motion_px = None            # 今フレームの基準からの移動量 [px, 縮小画像]（CSV 用）
+pnp_anchor_on = None                   # ㉕ 遮蔽中の PnP でいま使っている歯群（統合に入るたびに None に戻す）
 pnp_last_good = None                   # 直近の F 良好フレーム (縮小グレー, F 姿勢, 時刻)。遮蔽が始まったらキーフレームにする
 pnp_f_since = None                     # F で出力し始めた時刻（統合中は None）。戻った直後の F はキーフレームにしない
 f_guard = None                         # ⑥ F 追跡中の見張り用キーフレーム特徴点 PnP（pnp_keyframe_begin の戻り値）
@@ -4430,18 +4443,23 @@ while True:
                     # 遮蔽で流れた F 姿勢と last_good の差を跳び量ゲートに拒否させないため prev_output_pose を外す）。
                     if qF_ < ANCHOR_F_OK_QUALITY and last_good_pose is not None and now_t >= group_block_until:
                         fusion_off_f = True
-                        _depart = last_good_pose
+                        # ㉗ 良好姿勢が古ければ（F の適合度が「良好」に届かないまま模型が動いていた）、前フレームの出力から始める
+                        _base = last_good_pose
+                        if (FUSION_DEPART_STALE_SEC > 0 and prev_output_pose is not None
+                                and now_t - last_good_time > FUSION_DEPART_STALE_SEC):
+                            _base = prev_output_pose.astype(np.float32).copy()
+                        _depart = _base
                         _from_guard = False
                         if (FUSION_DEPART_FROM_GUARD and f_guard_pose_now is not None
                                 and float(np.linalg.norm(_group_center_cam("F", f_guard_pose_now)
-                                                         - _group_center_cam("F", last_good_pose))) <= 0.010
-                                and rotation_angle_deg(f_guard_pose_now, last_good_pose) <= 10.0):
+                                                         - _group_center_cam("F", _base))) <= 0.010
+                                and rotation_angle_deg(f_guard_pose_now, _base) <= 10.0):
                             # ⑰ 手が入りかけて F がずれ始めた姿勢（last_good）ではなく、見張りの PnP がこのフレームで解いた姿勢から始める
                             _depart = f_guard_pose_now.astype(np.float32).copy()
                             if FUSION_DEPART_FROM_GUARD == 2:
                                 # 回転だけ見張りから。F 重心の位置は last_good のまま（見張りの並進は 2〜3 mm 偏ることがある）
                                 _cF = ANCHOR_BY_KEY["F"]["centroid"]
-                                _depart[:3, 3] = (last_good_pose[:3, :3] @ _cF + last_good_pose[:3, 3]) - _depart[:3, :3] @ _cF
+                                _depart[:3, 3] = (_base[:3, :3] @ _cF + _base[:3, 3]) - _depart[:3, :3] @ _cF
                             _from_guard = True
                         anchor_switch_pose = _depart.copy()
                         anchor_switch_time = now_t
@@ -4459,6 +4477,7 @@ while True:
                         fusion_rot_prev_R = {}
                         fusion_pnp = None
                         fusion_pnp_bad_since = None
+                        pnp_anchor_on = None
                         if _from_guard and FUSION_DEPART_FROM_GUARD == 1 and FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp":
                             fusion_pnp = f_guard          # ⑰ 離脱時の姿勢を出した見張りの点をそのまま使う
                             print("統合: 離脱時の姿勢・回転源 PnP とも F の見張りから")
@@ -4497,7 +4516,9 @@ while True:
                     elif fusion_f_ok_since is not None and now_t - fusion_f_ok_since >= FUSION_F_RETURN_SEC:
                         reason = f"F が {FUSION_F_RETURN_SEC:.0f} s 以上良好"
                     elif (fusion_no_member_since is not None and now_t - fusion_no_member_since >= FUSION_NO_MEMBER_SEC
-                          and qF_ >= ANCHOR_F_OK_QUALITY):
+                          and qF_ >= ANCHOR_F_OK_QUALITY
+                          # ㉖ PnP で追えている間は「使える歯群なし」では戻らない
+                          and not (FUSION_KEEP_PNP_NO_MEMBER and fusion_pnp is not None and fusion_pnp_bad_since is None)):
                         reason = "使える歯群なし"
                     if reason is not None:
                         print(f"統合解除 → F (F={qF_:.2f}, {reason})")
@@ -4630,8 +4651,14 @@ while True:
                                 _c_prior = _group_center_cam("F", prev_output_pose)
                             else:
                                 _c_prior = None
-                            _anchor_ok = ({k for k in ("A", "B", "C", "D")
-                                           if quality_by_key.get(k, 0.0) >= FUSION_PNP_ANCHOR_Q} if FUSION_PNP_ANCHORS else None)
+                            _anchor_ok = None
+                            if FUSION_PNP_ANCHORS:
+                                # ㉕ 使っている歯群は Q_OFF を割るまで残す（θG の付近で毎フレーム入れ替わらないように）
+                                _prev_on = pnp_anchor_on or set()
+                                pnp_anchor_on = {k for k in ("A", "B", "C", "D")
+                                                 if quality_by_key.get(k, 0.0) >= (FUSION_PNP_ANCHOR_Q_OFF if k in _prev_on
+                                                                                   else FUSION_PNP_ANCHOR_Q)}
+                                _anchor_ok = pnp_anchor_on
                             fusion_pnp_info = pnp_track(fusion_pnp, _pnp_gray(frame_img), _c_prior, bgr=frame_img,
                                                         edge_ctx=(dist_map, list(sane)) if (sane and FUSION_PNP_USE_EDGES) else None,
                                                         anchor_ok=_anchor_ok)
