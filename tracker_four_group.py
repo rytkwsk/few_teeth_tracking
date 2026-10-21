@@ -107,9 +107,23 @@ import threading
 import traceback
 import time
 
+import queue as _queue
+
 import cv2
 import numpy as np
 import pym3t
+
+# ─── 録画クリップの再生（オフライン調整，2026-10-21） ─────────────────────────────
+# M3T_REPLAY_CLIP=<クリップのフォルダ>（experiment/record.py で録ったもの）を渡すと、カメラの代わりにその録画を読み、
+# 録画開始時の姿勢から追跡を始め、最後のフレームで終了する。設定を変えて同じ映像を何度でも処理して比べるため。
+# 滞在時間・クールダウンなどの時間依存の処理が録画時と同じに動くよう、time.time() は「いま処理しているフレームの
+# 録画時刻」を返す。Unity への送信・ポートの待受・診断フレームの保存はしない（並列に何本も動かせる）。
+# ログは M3T_REPLAY_LOG（無ければクリップのフォルダの replay.csv）。
+REPLAY_CLIP_DIR = os.environ.get("M3T_REPLAY_CLIP", "")
+REPLAY = bool(REPLAY_CLIP_DIR)
+_replay_clock = [0.0]
+if REPLAY:
+    time.time = lambda: _replay_clock[0]
 
 # ─── クラッシュ捕捉 ─────────────────────────────────────────────────────────
 # 原因不明の「勝手に終了する」現象を調査するため、メインスレッド・別スレッド
@@ -255,12 +269,12 @@ FUSION_TRANS_SMOOTH       = 0.5    # 統合姿勢の並進の平滑化係数（1
 # に置く（画像上の位置は歯群に従い、奥行きは F を離れた時点のまま）。遮蔽中に模型が奥行き方向へ動くと追えないが、
 # 7〜15 mm のノイズを毎フレーム出すよりよい。best-one（GROUP_ROTATION_FROM_F）と統合モードの両方に効く。
 GROUP_DEPTH_FROM_REF      = True
-FUSION_F_RETURN_SEC       = 2.0    # F のスコアがこれだけ連続して回復閾値以上なら歯群の見え方によらず F へ復帰
+FUSION_F_RETURN_SEC       = float(os.environ.get("M3T_F_RETURN_SEC", "2.0"))   # F のスコアがこれだけ連続して回復閾値以上なら歯群の見え方によらず F へ復帰
 FUSION_NO_MEMBER_SEC      = 1.0    # 使える歯群がこれだけ無く F が OK 閾値以上なら F へ戻す
 ANCHOR_F_OK_QUALITY       = float(os.environ.get("M3T_F_OK_Q", "0.45"))   # F の単体適合度がこれ以上なら F を出力（切替しない）
 # ↑ 案 E（2026-10-14 13:00 run）: 統合中も追跡している F ボディ自身の誤差は qF 0.35〜0.45 で中央値 1.3〜1.4 mm / p90 ≤3.4 mm
 #   （ただし毎フレーム統合姿勢から 1 step した値なので、F 単独で何秒も粘れる証拠ではない）。M3T_F_OK_Q=0.38 で試して比較する。
-ANCHOR_F_RECOVER_QUALITY  = 0.55   # 歯群へ切替後、F がこれ以上に戻ったら F へ復帰（0.45 で復帰すると往復した）
+ANCHOR_F_RECOVER_QUALITY  = float(os.environ.get("M3T_F_RECOVER_Q", "0.55"))   # 歯群へ切替後、F がこれ以上に戻ったら F へ復帰（0.45 で復帰すると往復した）
 ANCHOR_GROUP_MIN_QUALITY = 0.60   # 0.55→0.60 (2026-10-01)。副アンカーへ切り替える最低適合度
 ANCHOR_SWITCH_MAX_ROT_DEG = 15.0   # 20→15 (2026-10-01: 歯群 D が切替後 0.5 s で 63 mm ずれた)
 ANCHOR_SWITCH_MAX_TRANS_M = 0.015   # 20 mm → 15 mm (2026-10-01)
@@ -316,7 +330,9 @@ FUSION_ROT_MAX_JITTER_DEG = 4.0     # 歯群ボディの回転が前フレーム
 FUSION_ROT_MAX_DIFF_DEG   = 25.0    # 歯群の回転が現在の出力回転からこれ以上離れていたら誤適合とみなして無視
 FUSION_ROT_BLEND          = 0.25    # 1 フレームで残差のこの割合だけ寄せる（≈4 フレームで 1/e）
 FUSION_ROT_MAX_STEP_DEG   = 3.0     # 1 フレームの回転変化量の上限（2→3: 12:09 run で 1.6 s に 20° 回したとき追従が 10° 遅れた）
-FUSION_ROT_MAX_TOTAL_DEG  = 35.0    # 離脱時の回転からの累計上限（25→35: 12:09 run で実際に 30° 回して上限に当たった）
+# 離脱時の回転からの累計上限（25→35: 12:09 run で実際に 30° 回して上限に当たった）。2026-10-21 の大きく回した録画では
+# 真値 42° に対し PnP は 40° と正しく出していたのに 35° で止まり 6〜7° ずれた → M3T_FUSION_ROT_MAX_TOTAL_DEG で変更
+FUSION_ROT_MAX_TOTAL_DEG  = float(os.environ.get("M3T_FUSION_ROT_MAX_TOTAL_DEG", "35.0"))
 # 歯群ボディの回転は F と系統的にずれる（2026-10-14 11:53 run: F が q 0.77 で安定していても A は出力から中央値 5.3°、
 # B 8.6° 離れた向きに収束する。メッシュと実物の差や 3 本歯の拘束の弱さによる偏り）。そのまま追従すると遮蔽のたびに
 # その偏りの分だけ回ってしまうので、F 追跡中に「歯群の回転 → 出力回転」の相対回転（モデル座標）を EMA で覚えておき、
@@ -433,6 +449,19 @@ F_GUARD_DIVERGE_MM     = float(os.environ.get("M3T_F_GUARD_MM", "8.0"))
 F_GUARD_DIVERGE_DEG    = float(os.environ.get("M3T_F_GUARD_DEG", "8.0"))
 F_GUARD_DIVERGE_FRAMES = 2
 F_GUARD_MIN_POINTS     = 25
+# ⑯ 統合から F に戻った直後は、F が統合のずれ（5〜8°）を引き継いでいる。0.3 s でそこから見張りのキーフレームを作ると、
+#   その後 F が正しい姿勢へ収束しようとするたびに見張りがずれた姿勢へ戻した（2026-10-21 occ_rot_01 の再生: 0.2 s ごとに
+#   5° の「戻し」が続き 8.6° のまま）。戻った後は F_GUARD_AFTER_RETURN_SEC 待ってから作る。M3T_F_GUARD_AFTER_RETURN で変更。
+F_GUARD_AFTER_RETURN_SEC = float(os.environ.get("M3T_F_GUARD_AFTER_RETURN", "0.3"))
+# ⑮ 統合に入るときに直近の F 良好フレームが無ければ、F の見張りが追っている点の集合を遮蔽中の PnP に引き継ぐ。
+#   M3T_FUSION_PNP_FROM_GUARD=1 で有効。
+FUSION_PNP_FROM_GUARD = os.environ.get("M3T_FUSION_PNP_FROM_GUARD", "0") == "1"
+# ⑰ 統合に入るときの姿勢（離脱時の姿勢）を、手が入りかけてずれ始めた F（last_good）ではなく、そのフレームで F の見張りの
+#   PnP が解いた姿勢にする（last_good から 10 mm / 10° 以内のとき）。回転源 PnP も見張りの点をそのまま使う。
+#   2026-10-21 occ_trans_02: 直前まで 0.3° だった F が統合に入るフレームで 2.7° ずれ、その回転が遮蔽中ずっと保持された。
+#   M3T_FUSION_DEPART_FROM_GUARD=1 で姿勢ごと（回転源 PnP も見張りの点）、=2 で回転だけ見張りから（F 重心の位置は last_good、
+#   回転源 PnP は従来どおり直近の良好フレームから。見張りのキーフレームは並進が 2〜3 mm 偏ることがあった: occ_static_01 で 86→40%）。
+FUSION_DEPART_FROM_GUARD = int(os.environ.get("M3T_FUSION_DEPART_FROM_GUARD", "0") or 0)
 F_GUARD_MAX_RES_PX     = 1.0
 # ⑦ 統合から抜け出せない状態の検知（2026-10-20 19:47 run）: 遮蔽中に回して回転が 17.6° ずれたまま PnP の点が 0 になり、
 #   手を離して A/B は q 0.7 で見えているのに、F は出力（ずれた姿勢）へ毎フレーム同期されるので q 0.52〜0.55 から上がらず
@@ -454,6 +483,17 @@ FUSION_PNP_ZUPT_SIGMA    = 2.0     # ZUPT: キーフレームからの回転が 
 # 押さえ込んだ（11:35 run 78.5 s の区間を保存フレームで再生: 終了時 9.4°→10 mm で 4.4°。他の区間はほぼ不変）
 FUSION_PNP_PRIOR_SIGMA_M = 0.010
 FUSION_PNP_BLEND         = 0.5     # 1 フレームで PnP 回転へ寄せる割合
+# ⑭ 回転を模型座標の 1 軸まわりに制限（2026-10-21 自宅の録画で評価）: 遮蔽中に動かすと、点の当てはまりは正しい回転でも
+#   4〜5° ずれた回転でも 0.35 px 以内しか違わず（回転がほぼ決まらない）、点のわずかな偏りで誤った側に倒れていた
+#   （平行移動を回転と取り違え、回転を傾きとして出す）。模型を机に置いて動かす限り回転は机の法線まわりだけで、
+#   録画の真値の回転軸は模型の +y から 1.26°（ばらつき 0.65°）。保存した点で解き直すと、遮蔽中に動かす区間の
+#   2 mm・2° 未満が 27% → 96%。臨床（頭が自由に動く）では成り立たない仮定なのでデモ・評価用。
+#   M3T_FUSION_PNP_AXIS="0,1,0.022"（模型座標の軸）で有効、空で 3 軸（従来）。特徴点を使う F の見張りにも効く。
+_pnp_axis_env = os.environ.get("M3T_FUSION_PNP_AXIS", "").strip()
+FUSION_PNP_AXIS = None
+if _pnp_axis_env:
+    FUSION_PNP_AXIS = np.array([float(v) for v in _pnp_axis_env.split(",")], np.float64)
+    FUSION_PNP_AXIS /= np.linalg.norm(FUSION_PNP_AXIS)
 # 遮蔽直前の F 良好フレームがこれより古ければキーフレームにしない（1.0→3.0: 11:43 run で遮蔽の合間の F が 0.04〜0.8 s と
 # 短く、一瞬 F に戻ってから遮蔽が始まると 1 s を超えて 20 区間中 9 区間でキーフレームが作れず回転を保持した）
 FUSION_PNP_KEYFRAME_MAX_AGE_SEC = 3.0
@@ -463,6 +503,33 @@ FUSION_PNP_KEYFRAME_MIN_QF = 0.50       # 15:24 run の F 追跡中 qF は中央
 # キーフレームにする。1.0 s では 11:43 run の 20 区間中 11 区間しか作れず、0.3 s・3.0 s なら 19 区間（同 run の記録で計算、
 # キーフレーム時点の誤差 中央値 1.2°、最大 10.7°。F 自体が外れていた時間のフレームは q では区別できない）。
 FUSION_PNP_KEYFRAME_MIN_F_SEC = 0.3
+# ⑪ キーフレームの検算（2026-10-21 自宅 10:06 run）: 遮蔽直前の 0.5 s で F が x・z 軸まわりに 9° 滑り（qF 0.58〜0.63 のまま）、
+#   ⑥ の見張りが戻した直後に遮蔽が始まった。キーフレームは見張りが戻す前のフレーム（ArUco 8.7°）になり、戻した後のフレームは
+#   qF < 0.50 で控えられなかった。遮蔽中は静止のあいだ離脱時の回転（正しい）を保持していたが、動き出して PnP の回転を採った瞬間に
+#   キーフレームのずれへ寄り、遮蔽の終わりまで 9〜13° ずれた。対策: (a) 見張りの PnP と F の差が下の値を超えるフレームは
+#   キーフレームにしない（F 自体のずれを q の代わりに見張りで判定）、(b) 見張りが F を戻したフレームは戻した姿勢をキーフレームにする。
+#   M3T_FUSION_PNP_KEY_GUARD_DEG=0 で (a) を無効。
+FUSION_PNP_KEYFRAME_GUARD_DEG = float(os.environ.get("M3T_FUSION_PNP_KEY_GUARD_DEG", "3.0"))
+FUSION_PNP_KEYFRAME_GUARD_MM  = float(os.environ.get("M3T_FUSION_PNP_KEY_GUARD_MM", "4.0"))
+# ⑫ 遮蔽中は PnP が生きている間、品質低下による自動再ロックを待つ（2026-10-21 自宅 10:22 run）: 手で歯列の半分を 10 s 覆い、
+#   使える歯群なし・q 0.33〜0.47 のまま PnP で保持（ArUco 1〜3 mm）していたのに、HOLD が続いたので自動再ロックが走った。
+#   手が乗ったままの近傍探索は 2 回失敗（q 0.27 / 0.13）→ 並進探索へ格上げ → 手がどいた後、白い照明で歯色に見える台座の模様に
+#   q 0.79 で誤ロック（37 mm / 35°）。PnP（遮蔽前の良好フレーム基準）が解けている間は見失っていないので探索しない。
+#   誤ロック検知・統合から抜け出せない状態（force_relock）は従来どおり。FUSION_PNP_DEFER_MAX_SEC を超えたら従来どおり再ロック。
+#   M3T_PNP_DEFER_RELOCK=0 で従来。
+FUSION_PNP_DEFER_RELOCK  = os.environ.get("M3T_PNP_DEFER_RELOCK", "1") != "0"
+FUSION_PNP_DEFER_MAX_SEC = 30.0
+# ⑬ 統合中の F の試走（2026-10-21 録画の再生で評価）: 統合中は全アンカーを毎フレーム出力姿勢へ戻していたので、出力が 5〜8° ずれた
+#   まま手を離しても F は 1 step しか進めず q が 0.42〜0.50 から上がらず、F への復帰に 1.2〜3.4 s かかった（その間ずれたまま）。
+#   統合中は F だけ出力へ戻さずに追わせ、出力から F_FREE_MAX_MM / _DEG 以上離れたら出力へ戻す。M3T_F_FREE=1 で有効。
+F_FREE_IN_FUSION = os.environ.get("M3T_F_FREE", "0") == "1"
+# 診断（2026-10-21）: M3T_PNP_DUMP=<path.pkl> で、統合中の特徴点 PnP の点（2D 位置・3D 点・結び付けた姿勢）を毎フレーム保存する。
+#   experiment/pnp_diag.py が ArUco の真値姿勢で投影し直して、点が壊れているのか解き方の問題かを切り分ける。
+PNP_DUMP_PATH = os.environ.get("M3T_PNP_DUMP", "")
+_pnp_dump_segments = []
+_pnp_dump_frames = []
+F_FREE_MAX_MM    = float(os.environ.get("M3T_F_FREE_MM", "15"))
+F_FREE_MAX_DEG   = float(os.environ.get("M3T_F_FREE_DEG", "15"))
 # マーカー基準が古い疑いの検知（2026-10-14: 10/09 の登録のまま測ったら全フレーム 15 mm / 17° の一定誤差だった。
 # ボードか模型が動いた＝物理的な関係が変わったのに、q は 0.6 台で見た目は普通に追えていた）。
 # F が良好に追跡しているのに誤差が大きい状態が続いたら、Unity パネルに登録し直しを促す。
@@ -537,6 +604,8 @@ UNITY_UDP_HOST      = "127.0.0.1"
 UNITY_UDP_PORT      = 5005
 UNITY_COMMAND_PORT  = 5006
 UNITY_VIDEO_ENABLED = True
+if REPLAY:
+    UNITY_UDP_ENABLED = UNITY_VIDEO_ENABLED = False
 UNITY_VIDEO_PORT    = 5010
 UNITY_VIDEO_FPS     = 30   # 10→20→30: カメラは 24 fps 固定（2026-10-09 実測）なので 20 で間引くと
                            # テンポずれと最大 50 ms の表示遅れが出る。30 なら全フレーム送る（エンコードは別スレッド）
@@ -760,7 +829,7 @@ AUTO_CAPTURE_AFTER_RECOVERY_SEC = 3.0  # 再ロック直後はスナップ中の
 
 # オフラインで品質指標・閾値を調整するため、追跡中の生フレームを N フレームごとに
 # logs/tracking_<ts>_frames/ に保存する（CSV の frame 列と対応）。0 で無効。
-DIAG_FRAME_DUMP_EVERY = 20
+DIAG_FRAME_DUMP_EVERY = 0 if REPLAY else 20   # 再生時は元の録画があるので保存しない
 AUTO_CAPTURE_MIN_ANGLE_DEG = 10.0     # 既存スロットとこの角度以上離れていたら新規とみなす
 AUTO_CAPTURE_MIN_TRANSLATION_M = 0.01  # 既存スロットとこの距離以上離れていたら新規とみなす
 AUTO_CAPTURE_COOLDOWN_SEC = 3.0       # 自動登録の最短間隔
@@ -791,13 +860,58 @@ if os.name != "nt":
 
 # カメラ番号は camera_io.camera_index(): M3T_CAMERA_INDEX があればそれ、無ければ Windows では DirectShow の
 # デバイス名（M3T_CAMERA_NAME、既定 iVCam）で探す（OMEN では内蔵カメラが 0、iVCam が 0 か 1 で接続状況により変わる）。
-cap, _ = camera_io.open_camera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT)
+class ReplaySource:
+    """録画クリップ（video.avi + frames.csv）を読むカメラ代わり。read() のたびに仮想時計をそのフレームの録画時刻に進める。"""
+
+    def __init__(self, clip_dir):
+        self._cap = cv2.VideoCapture(os.path.join(clip_dir, "video.avi"))
+        with open(os.path.join(clip_dir, "frames.csv"), encoding="utf-8") as f:
+            self._ts = [float(r["timestamp"]) for r in csv.DictReader(f)]
+        self._fi = 0
+        self._pending = None
+        if self._ts:
+            _replay_clock[0] = self._ts[0]
+
+    def peek(self):
+        """最初のフレームを読んで返す（次の read() でも同じフレームを返す。画像サイズの取得用）。"""
+        ok, img = self.read()
+        if ok:
+            self._pending = img
+        return ok, img
+
+    def read(self):
+        if self._pending is not None:
+            img, self._pending = self._pending, None
+            return True, img
+        ok, img = self._cap.read()
+        if not ok or self._fi >= len(self._ts):
+            return False, None
+        _replay_clock[0] = self._ts[self._fi]
+        self._fi += 1
+        return True, img
+
+    def set(self, *args):
+        return False
+
+    def get(self, prop):
+        return self._cap.get(prop)
+
+    def release(self):
+        self._cap.release()
+
+
+if REPLAY:
+    cap = ReplaySource(REPLAY_CLIP_DIR)
+    CAMERA_MANUAL_EXPOSURE = None
+    print(f"[replay] {REPLAY_CLIP_DIR}")
+else:
+    cap, _ = camera_io.open_camera(width=CAMERA_WIDTH, height=CAMERA_HEIGHT)
 
 if CAMERA_MANUAL_EXPOSURE is not None:
     cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)
     cap.set(cv2.CAP_PROP_EXPOSURE, CAMERA_MANUAL_EXPOSURE)
 
-ret, frame = cap.read()
+ret, frame = cap.peek() if REPLAY else cap.read()
 if not ret:
     raise RuntimeError("カメラの読み取りに失敗しました")
 
@@ -856,7 +970,24 @@ class _LatestFrameGrabber:
         self._thread.join(timeout=1.0)
 
 
-_grabber = _LatestFrameGrabber(cap)
+class _ReplayGrabber:
+    """再生時は録画したフレームを 1 枚ずつ順に渡す（間引かない）。"""
+
+    def __init__(self, capture):
+        self._cap = capture
+        self._seq = 0
+
+    def read(self, last_seq, timeout=0.5):
+        ret, frame = self._cap.read()
+        if ret:
+            self._seq += 1
+        return ret, frame, self._seq
+
+    def stop(self):
+        pass
+
+
+_grabber = _ReplayGrabber(cap) if REPLAY else _LatestFrameGrabber(cap)
 _frame_seq = 0
 
 # 品質評価（方向付きエッジ距離マップ）は 640 幅相当に縮小して計算する。
@@ -930,8 +1061,10 @@ MARKER_MASK_PAD_PX = int(round(25 * w / 640.0))   # マーカー外側の白い�
 from marker_reference import MarkerReference
 marker_ref = None
 if MARKER_REF_ENABLED:
-    marker_ref = MarkerReference(K, None, os.path.join(pose_slots_dir, "marker_registration.json"),
-                                 scale=MARKER_PRINT_SCALE)
+    _marker_reg_path = os.path.join(pose_slots_dir, "marker_registration.json")
+    if REPLAY and os.path.exists(os.path.join(REPLAY_CLIP_DIR, "marker_registration.json")):
+        _marker_reg_path = os.path.join(REPLAY_CLIP_DIR, "marker_registration.json")   # 録画時点の登録で評価する
+    marker_ref = MarkerReference(K, None, _marker_reg_path, scale=MARKER_PRINT_SCALE)
     if marker_ref.T_ref_model:
         for _k in marker_ref.T_ref_model:
             _s = marker_ref.summary(_k)
@@ -2058,7 +2191,7 @@ def _pnp_detect(gray, R, t, max_features, extra_mask=None):
     return np.array(keep_pts, np.float32), V[keep_ids]
 
 
-def pnp_keyframe_begin(gray, pose):
+def pnp_keyframe_begin(gray, pose, kf_time=None):
     """遮蔽直前の F 良好フレーム（縮小グレー）と姿勢から、メッシュに結び付いた特徴点の集合を作る。取れなければ None。"""
     R, t = pose[:3, :3].astype(np.float64), pose[:3, 3].astype(np.float64)
     pts, X = _pnp_detect(gray, R, t, FUSION_PNP_MAX_POINTS)
@@ -2066,7 +2199,10 @@ def pnp_keyframe_begin(gray, pose):
         return None
     return {"Ks": _pnp_Ks(), "X": X, "cur": pts.copy(), "kf_pts": pts.copy(),
             "alive": np.ones(len(pts), bool), "gray": gray, "kf_patches": _pnp_patches(gray, pts),
-            "R0": R.copy(), "t0": t.copy(), "R": R.copy(), "t": t.copy(), "n0": len(pts), "refreshed": 0}
+            "R0": R.copy(), "t0": t.copy(), "R": R.copy(), "t": t.copy(), "n0": len(pts), "refreshed": 0,
+            # 診断用（M3T_PNP_DUMP）: 各点を結び付けた姿勢の番号と、その姿勢・時刻の一覧
+            "born": np.zeros(len(pts), np.int32), "born_poses": [(kf_time, R.copy(), t.copy())],
+            "born_uv": pts.copy()}
 
 
 def _pnp_refresh(st, gray, tooth_mask):
@@ -2088,6 +2224,9 @@ def _pnp_refresh(st, gray, tooth_mask):
     st["alive"] = np.concatenate([st["alive"], np.ones(len(pts), bool)])
     st["kf_patches"] = np.vstack([st["kf_patches"], _pnp_patches(gray, pts)])
     st["refreshed"] += 1
+    st["born_poses"].append((time.time(), st["R"].copy(), st["t"].copy()))
+    st["born"] = np.concatenate([st["born"], np.full(len(pts), len(st["born_poses"]) - 1, np.int32)])
+    st["born_uv"] = np.vstack([st["born_uv"], pts])
     return len(pts)
 
 
@@ -2167,26 +2306,29 @@ def _pnp_solve(st, X, u, c_prior, iters=8, huber=None, R_init=None, t_init=None,
         return rp, np.concatenate([rc, re])
 
     J = None
+    axis = FUSION_PNP_AXIS                     # ⑭ 回転を模型座標の 1 軸まわりに制限（None なら 3 軸）
+    n_rot = 1 if axis is not None else 3
+    n_dof = n_rot + 3
     for _ in range(iters):
         if edge_sets:
             layers = _pnp_edge_layers(edge_sets, R, t, Ks)
         rp, rc = residual(R, t)
         r = np.concatenate([rp, rc])
-        J = np.zeros((len(r), 6))
+        J = np.zeros((len(r), n_dof))
         eps = 1e-6
-        for k in range(6):
-            d = np.zeros(6)
+        for k in range(n_dof):
+            d = np.zeros(n_dof)
             d[k] = eps
-            Rk = cv2.Rodrigues(d[:3])[0] @ R
-            rpk, rck = residual(Rk, t + d[3:])
+            Rk = (R @ cv2.Rodrigues(axis * d[0])[0]) if axis is not None else (cv2.Rodrigues(d[:3])[0] @ R)
+            rpk, rck = residual(Rk, t + d[n_rot:])
             J[:, k] = (np.concatenate([rpk, rck]) - r) / eps
         a = np.abs(r[:len(rp)])
         wts = np.concatenate([np.where(a <= huber, 1.0, huber / np.maximum(a, 1e-9)), np.ones(len(rc))])
         JW = J * wts[:, None]
-        dx = -np.linalg.solve(JW.T @ J + 1e-12 * np.eye(6), JW.T @ r)
-        R = cv2.Rodrigues(dx[:3])[0] @ R
-        t = t + dx[3:]
-        if np.linalg.norm(dx[:3]) < 1e-7 and np.linalg.norm(dx[3:]) < 1e-7:
+        dx = -np.linalg.solve(JW.T @ J + 1e-12 * np.eye(n_dof), JW.T @ r)
+        R = (R @ cv2.Rodrigues(axis * dx[0])[0]) if axis is not None else (cv2.Rodrigues(dx[:3])[0] @ R)
+        t = t + dx[n_rot:]
+        if np.linalg.norm(dx[:n_rot]) < 1e-7 and np.linalg.norm(dx[n_rot:]) < 1e-7:
             break
     res = np.linalg.norm(_pnp_project(X @ R.T + t, Ks) - u, axis=1)
     # 2 次元誤差の大きさ |e| の中央値は σ√(2 ln 2) = 1.177σ（レイリー分布）。以前は 1 次元用の 0.45 で割っていて
@@ -2194,7 +2336,7 @@ def _pnp_solve(st, X, u, c_prior, iters=8, huber=None, R_init=None, t_init=None,
     sigma2 = float(np.median(res) ** 2 / 1.386 + 1e-6)
     try:
         cov = sigma2 * np.linalg.inv(J.T @ J)
-        std_deg = float(np.degrees(np.sqrt(max(np.max(np.linalg.eigvalsh(cov[:3, :3])), 0.0))))
+        std_deg = float(np.degrees(np.sqrt(max(np.max(np.linalg.eigvalsh(cov[:n_rot, :n_rot])), 0.0))))
     except np.linalg.LinAlgError:
         std_deg = float("inf")
     return R, t, res, std_deg
@@ -2919,6 +3061,7 @@ pnp_f_since = None                     # F で出力し始めた時刻（統合�
 f_guard = None                         # ⑥ F 追跡中の見張り用キーフレーム特徴点 PnP（pnp_keyframe_begin の戻り値）
 f_guard_time = 0.0                     # その作成時刻
 f_guard_streak = 0                     # F が PnP から離れている連続フレーム数
+f_guard_after_return = False           # ⑯ 統合から戻った後、まだ見張りのキーフレームを作っていない
 fusion_pnp_bad_since = None            # ⑦ 統合中に PnP が使えなくなった時刻（使えていれば None）
 fusion_stuck_relock_time = 0.0         # ⑦ 最後に抜け出せない状態から再ロックした時刻
 fusion_pnp = None                      # 統合中のキーフレーム特徴点 PnP の状態（pnp_keyframe_begin の戻り値）
@@ -3156,6 +3299,149 @@ def undo_marker_sample():
     marker_status_text = msg
 
 
+# ─── 録画（オフライン調整用，2026-10-21） ───────────────────────────────────────
+# experiment/record.py が UDP（コマンドポート）で record_start:<名前> / event:<文字列> / record_stop を送る。
+# 追跡に渡す前の生フレーム（歪み補正前）を experiment/sessions/<名前>/video.avi（MJPG）に、各フレームの時刻を frames.csv に、
+# 録画開始時の出力姿勢を start_pose.npy に保存する。再生（M3T_REPLAY_CLIP）はこの姿勢から始めるので、
+# 録画は F で安定して追跡しているときだけ始める（遮蔽前に 2 s 以上 F で追える区間を入れること: PnP のキーフレームと
+# F の見張りは F 追跡 0.3 s 後から作られる）。
+EXPERIMENT_DIR = os.path.join(SCRIPT_DIR, "experiment")
+RECORD_FPS_NOMINAL = 20.0     # AVI ヘッダ用の名目値。再生は frames.csv の実時刻で進むので結果には影響しない
+
+
+class SessionRecorder:
+    def __init__(self):
+        self.q = _queue.Queue(maxsize=600)
+        self.active = False
+        self.clip_dir = None
+        self.n = 0
+        self.dropped = 0
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def start(self, clip_dir, meta):
+        if self.active:
+            self.stop()
+        os.makedirs(clip_dir, exist_ok=True)
+        self.clip_dir = clip_dir
+        self.n = 0
+        self.dropped = 0
+        self.active = True
+        self.q.put(("start", clip_dir, meta))
+
+    def push(self, raw, ts, start_pose):
+        if not self.active:
+            return
+        if self.n == 0:
+            self.q.put(("start_pose", np.asarray(start_pose, np.float32).copy()))
+        try:
+            self.q.put_nowait(("frame", raw, ts, self.n))
+            self.n += 1
+        except _queue.Full:
+            self.dropped += 1   # 書き出しが追いつかないとき（その分は frames.csv にも載らない）
+
+    def event(self, text, ts):
+        if self.active:
+            self.q.put(("event", self.n, ts, text))
+
+    def stop(self):
+        if self.active:
+            self.active = False
+            self.q.put(("stop", self.n, self.dropped))
+
+    def _loop(self):
+        writer = frames_f = events_f = frames_w = events_w = None
+        clip_dir = None
+        while True:
+            item = self.q.get()
+            kind = item[0]
+            try:
+                if kind == "start":
+                    clip_dir, meta = item[1], item[2]
+                    with open(os.path.join(clip_dir, "meta.json"), "w", encoding="utf-8") as f:
+                        json.dump(meta, f, ensure_ascii=False, indent=1)
+                    frames_f = open(os.path.join(clip_dir, "frames.csv"), "w", newline="", encoding="utf-8")
+                    frames_w = csv.writer(frames_f)
+                    frames_w.writerow(["index", "timestamp"])
+                    events_f = open(os.path.join(clip_dir, "events.csv"), "w", newline="", encoding="utf-8")
+                    events_w = csv.writer(events_f)
+                    events_w.writerow(["frame_index", "timestamp", "event"])
+                    writer = None
+                elif kind == "start_pose" and clip_dir:
+                    np.save(os.path.join(clip_dir, "start_pose.npy"), item[1])
+                elif kind == "frame" and frames_w is not None:
+                    raw, ts, idx = item[1], item[2], item[3]
+                    if writer is None:
+                        hh, ww = raw.shape[:2]
+                        writer = cv2.VideoWriter(os.path.join(clip_dir, "video.avi"),
+                                                 cv2.VideoWriter_fourcc(*"MJPG"), RECORD_FPS_NOMINAL, (ww, hh))
+                        writer.set(cv2.VIDEOWRITER_PROP_QUALITY, 95)
+                    writer.write(raw)
+                    frames_w.writerow([idx, f"{ts:.6f}"])
+                elif kind == "event" and events_w is not None:
+                    events_w.writerow([item[1], f"{item[2]:.6f}", item[3]])
+                    events_f.flush()
+                elif kind == "stop":
+                    if writer is not None:
+                        writer.release()
+                    for f in (frames_f, events_f):
+                        if f is not None:
+                            f.close()
+                    print(f"[record] 保存: {clip_dir}（{item[1]} フレーム、取りこぼし {item[2]}）")
+                    writer = frames_f = events_f = frames_w = events_w = None
+                    clip_dir = None
+            except Exception as e:
+                print(f"[record] 書き出しエラー: {e}")
+
+
+recorder = None if REPLAY else SessionRecorder()
+
+
+def handle_record_command(command, reply):
+    """録画の UDP コマンド。reply(text) で送信元に結果を返す（experiment/record.py が確認に使う）。"""
+    if command.startswith("record_start:"):
+        rel = command[len("record_start:"):].strip().replace("..", "_")
+        if not tracking_active:
+            reply("error:not_tracking")
+            print("[record] 追跡中でないため録画を開始しません（位置合わせして追跡を開始してから）")
+            return True
+        # 再生は録画開始時の姿勢から始まるので、F で安定して追えているときだけ始める
+        if snap_frames > 0 or fusion_off_f or quality_smoothed < QUALITY_GOOD_THRESHOLD:
+            reply(f"error:not_stable:q={quality_smoothed:.2f}:fusion={int(fusion_off_f)}:snap={int(snap_frames > 0)}")
+            print(f"[record] 追跡が安定していないため録画を開始しません（q={quality_smoothed:.2f}, "
+                  f"統合={int(fusion_off_f)}, SNAP={int(snap_frames > 0)}）")
+            return True
+        clip_dir = os.path.join(EXPERIMENT_DIR, "sessions", rel)
+        recorder.start(clip_dir, {
+            "clip": rel,
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "image_size": [int(w), int(h)],
+            "calibration": calibration_path,
+            "marker_registration": os.path.join(pose_slots_dir, "marker_registration.json"),
+            "commit_note": "tracker_four_group.py (main + ⑪⑫)",
+        })
+        try:   # 再生は録画時点のマーカー登録で評価する（後で登録し直しても比べられるように）
+            import shutil
+            shutil.copy(os.path.join(pose_slots_dir, "marker_registration.json"), clip_dir)
+        except OSError:
+            pass
+        reply("ok:record_start")
+        print(f"[record] 開始: {clip_dir}")
+        return True
+    if command == "record_stop":
+        recorder.stop()
+        reply("ok:record_stop")
+        return True
+    if command.startswith("event:"):
+        recorder.event(command[len("event:"):].strip(), time.time())
+        reply("ok:event")
+        return True
+    if command == "status":
+        reply(f"status:tracking={int(tracking_active)}:recording={int(recorder.active)}"
+              f":quality={quality_smoothed:.2f}:fusion={int(fusion_off_f)}:snap={int(snap_frames > 0)}")
+        return True
+    return False
+
+
 def poll_unity_commands(frame_bgr):
     """Unity からの UDP コマンド。デモは Unity の UI だけで初期位置合わせ〜追跡開始ができるように、
     OpenCV ウィンドウのキー操作に対応するコマンドを一通り受ける:
@@ -3171,15 +3457,26 @@ def poll_unity_commands(frame_bgr):
         return
     while True:
         try:
-            data, _ = command_socket.recvfrom(1024)
+            data, sender = command_socket.recvfrom(1024)
         except BlockingIOError:
             break
+        except ConnectionResetError:
+            continue   # Windows: 直前に返信した相手がもういないと次の recv がこれを出す
         except OSError as e:
             print(f"Unity コマンド UDP エラー: {e}")
             break
 
         command = data.decode("utf-8", errors="ignore").strip()
         cmd_lower = command.lower()
+
+        def _reply(text, _to=sender):
+            try:
+                command_socket.sendto(text.encode("utf-8"), _to)
+            except OSError:
+                pass
+
+        if recorder is not None and handle_record_command(command, _reply):
+            continue
         if cmd_lower == "start":
             if not tracking_active:
                 start_tracking_from_frame(frame_bgr, use_rotation_guard=True)
@@ -3385,6 +3682,9 @@ if UNITY_VIDEO_ENABLED:
 
 os.makedirs(log_dir, exist_ok=True)
 log_path = os.path.join(log_dir, f"tracking_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+if REPLAY:
+    log_path = os.environ.get("M3T_REPLAY_LOG") or os.path.join(REPLAY_CLIP_DIR, "replay.csv")
+    os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
 log_file = open(log_path, "w", newline="", encoding="utf-8")
 log_writer = csv.writer(log_file)
 log_writer.writerow([
@@ -3634,6 +3934,11 @@ def _pf_end():
 while True:
     _pf_begin()
     ret, raw, _frame_seq = _grabber.read(_frame_seq)   # 最新フレームのみ（別スレッド読み取り）
+    if not ret and REPLAY:
+        print("[replay] クリップの再生が終わりました")
+        break
+    if ret and recorder is not None and recorder.active:
+        recorder.push(raw, time.time(), pose)   # pose = 直前フレームの出力（再生はここから始める）
     if not ret:
         frame_read_failures += 1
         if frame_read_failures == 1:
@@ -3658,6 +3963,10 @@ while True:
             # 以降の追跡・品質評価・表示はボードを消した画像で行う（基準が追跡を汚さないように）
             frame_img = marker_ref.mask_out(frame_raw, pad_px=MARKER_MASK_PAD_PX, method=MARKER_MASK_METHOD)
     _pf_mark("marker")
+    if REPLAY and frame_idx == 0:
+        # 実機では録画開始時点で F の追跡が続いていたので、SNAP（再探索）はせずその姿勢から続ける
+        pose = np.load(os.path.join(REPLAY_CLIP_DIR, "start_pose.npy")).astype(np.float32)
+        start_tracking_from_current_pose(frame_img, light_snap_steps=0)
     frame_idx += 1
 
     # 映像は姿勢と同時に送る（ループの最後、send_pose_to_unity の直前）。以前はここで送っていて、Unity には
@@ -3869,18 +4178,18 @@ while True:
                 pnp_f_since = None
             elif pnp_f_since is None:
                 pnp_f_since = time.time()
-            if (FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp" and not fusion_off_f
-                    and time.time() - pnp_f_since >= FUSION_PNP_KEYFRAME_MIN_F_SEC
-                    and quality_by_key.get("F", 0.0) >= FUSION_PNP_KEYFRAME_MIN_QF):
-                pnp_last_good = (_pnp_gray(frame_img), poses_by_key["F"].copy(), time.time())
 
             # ⑥ F 追跡中の見張り: 特徴点 PnP と F が大きく食い違い続けたら F を PnP の姿勢へ戻す
+            f_guard_diff = None      # このフレームの見張り PnP と F の差 (mm, deg)。⑪ キーフレームの検算に使う
+            f_guard_pose_now = None  # このフレームで見張り PnP が解けたときの姿勢（⑰ 統合に入るときの姿勢）
+            f_guard_reset_now = False
             if F_GUARD_ENABLED and not fusion_off_f:
                 _now_g = time.time()
                 _gray_g = _pnp_gray(frame_img)
                 _fpose = poses_by_key["F"]
                 _qf_g = quality_by_key.get("F", 0.0)
-                _f_long = pnp_f_since is not None and _now_g - pnp_f_since >= F_GUARD_MIN_F_SEC
+                _f_long = pnp_f_since is not None and _now_g - pnp_f_since >= (
+                    F_GUARD_AFTER_RETURN_SEC if f_guard_after_return else F_GUARD_MIN_F_SEC)
                 _rekey = f_guard is None
                 if f_guard is not None:
                     _gi = pnp_track(f_guard, _gray_g, None, bgr=frame_img)
@@ -3888,6 +4197,8 @@ while True:
                         _P = pnp_output_pose(f_guard, f_guard["R"])
                         _d_mm = float(np.linalg.norm(_group_center_cam("F", _fpose) - _group_center_cam("F", _P))) * 1000.0
                         _d_deg = rotation_angle_deg(_fpose, _P)
+                        f_guard_diff = (_d_mm, _d_deg)
+                        f_guard_pose_now = _P
                         if _d_mm > F_GUARD_DIVERGE_MM or _d_deg > F_GUARD_DIVERGE_DEG:
                             f_guard_streak += 1
                         else:
@@ -3905,6 +4216,10 @@ while True:
                             pose_vel_rv = np.zeros(3)
                             frame_event = f"f_guard_reset {_d_mm:.0f}mm/{_d_deg:.0f}deg"
                             f_guard_streak = 0
+                            f_guard_reset_now = True
+                            # ⑪(b) 戻す前の F（ずれていた）を遮蔽中の PnP のキーフレームに残さない
+                            if FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp":
+                                pnp_last_good = (_gray_g, _P.copy(), _now_g)
                         elif (_d_mm <= F_GUARD_AGREE_MM and _d_deg <= F_GUARD_AGREE_DEG and _qf_g >= F_GUARD_MIN_QF
                               and _now_g - f_guard_time >= F_GUARD_REKEY_SEC):
                             _rekey = True
@@ -3916,10 +4231,21 @@ while True:
                     f_guard = pnp_keyframe_begin(_gray_g, poses_by_key["F"])
                     f_guard_time = _now_g
                     f_guard_streak = 0
+                    f_guard_after_return = False
             elif fusion_off_f:
                 f_guard = None
                 f_guard_streak = 0
             _pf_mark("f_guard")
+
+            # 回転源 PnP: F で出力している良好フレームを控えておき、遮蔽が始まったらそれをキーフレームにする
+            # （F に戻ってから FUSION_PNP_KEYFRAME_MIN_F_SEC 経つまでは控えない。⑪(a) 見張りと食い違う F は控えない）
+            _key_guard_ok = (FUSION_PNP_KEYFRAME_GUARD_DEG <= 0 or f_guard_diff is None
+                             or (f_guard_diff[0] <= FUSION_PNP_KEYFRAME_GUARD_MM
+                                 and f_guard_diff[1] <= FUSION_PNP_KEYFRAME_GUARD_DEG))
+            if (FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp" and not fusion_off_f and not f_guard_reset_now
+                    and time.time() - pnp_f_since >= FUSION_PNP_KEYFRAME_MIN_F_SEC
+                    and quality_by_key.get("F", 0.0) >= FUSION_PNP_KEYFRAME_MIN_QF and _key_guard_ok):
+                pnp_last_good = (_pnp_gray(frame_img), poses_by_key["F"].copy(), time.time())
 
             last_anchor_quality = dict(quality_by_key)
 
@@ -4040,25 +4366,49 @@ while True:
                     # 遮蔽で流れた F 姿勢と last_good の差を跳び量ゲートに拒否させないため prev_output_pose を外す）。
                     if qF_ < ANCHOR_F_OK_QUALITY and last_good_pose is not None and now_t >= group_block_until:
                         fusion_off_f = True
-                        anchor_switch_pose = last_good_pose.copy()
+                        _depart = last_good_pose
+                        _from_guard = False
+                        if (FUSION_DEPART_FROM_GUARD and f_guard_pose_now is not None
+                                and float(np.linalg.norm(_group_center_cam("F", f_guard_pose_now)
+                                                         - _group_center_cam("F", last_good_pose))) <= 0.010
+                                and rotation_angle_deg(f_guard_pose_now, last_good_pose) <= 10.0):
+                            # ⑰ 手が入りかけて F がずれ始めた姿勢（last_good）ではなく、見張りの PnP がこのフレームで解いた姿勢から始める
+                            _depart = f_guard_pose_now.astype(np.float32).copy()
+                            if FUSION_DEPART_FROM_GUARD == 2:
+                                # 回転だけ見張りから。F 重心の位置は last_good のまま（見張りの並進は 2〜3 mm 偏ることがある）
+                                _cF = ANCHOR_BY_KEY["F"]["centroid"]
+                                _depart[:3, 3] = (last_good_pose[:3, :3] @ _cF + last_good_pose[:3, 3]) - _depart[:3, :3] @ _cF
+                            _from_guard = True
+                        anchor_switch_pose = _depart.copy()
                         anchor_switch_time = now_t
-                        fusion_hold_pose = last_good_pose.copy()
+                        fusion_hold_pose = _depart.copy()
                         fusion_members = {}
                         fusion_enter_streak = {}
                         fusion_f_ok_since = None
                         fusion_no_member_since = None
                         prev_output_pose = None
                         # 回転追従の基準は離脱時の姿勢から（回転は固定スタート、F 重心の位置もここが基準）
-                        fusion_rot_ref = last_good_pose.copy()
+                        fusion_rot_ref = _depart.copy()
                         fusion_rot_src = ""
                         fusion_rot_total_deg = 0.0
                         fusion_rot_streak = {}
                         fusion_rot_prev_R = {}
                         fusion_pnp = None
                         fusion_pnp_bad_since = None
-                        if (FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp" and pnp_last_good is not None
+                        if _from_guard and FUSION_DEPART_FROM_GUARD == 1 and FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp":
+                            fusion_pnp = f_guard          # ⑰ 離脱時の姿勢を出した見張りの点をそのまま使う
+                            print("統合: 離脱時の姿勢・回転源 PnP とも F の見張りから")
+                        if (fusion_pnp is None and FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp" and pnp_last_good is not None
                                 and now_t - pnp_last_good[2] <= FUSION_PNP_KEYFRAME_MAX_AGE_SEC):
-                            fusion_pnp = pnp_keyframe_begin(pnp_last_good[0], pnp_last_good[1])
+                            fusion_pnp = pnp_keyframe_begin(pnp_last_good[0], pnp_last_good[1], pnp_last_good[2])
+                        if (fusion_pnp is None and FUSION_PNP_FROM_GUARD and FUSION_ROT_FROM_GROUP
+                                and FUSION_ROT_SOURCE == "pnp" and f_guard is not None and len(f_guard["X"]) >= FUSION_PNP_MIN_POINTS):
+                            # ⑮ 直近の良好フレームが無いときは、F の見張りが追い続けている点の集合を引き継ぐ（キーフレームは
+                            #   見張りが F と一致を確かめて作ったもの。点は今のフレームまで追えている）
+                            fusion_pnp = f_guard
+                            print("統合: 回転源 PnP は F の見張りの点を引き継ぐ")
+                        if PNP_DUMP_PATH and fusion_pnp is not None:
+                            _pnp_dump_segments.append(fusion_pnp)
                         if FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp":
                             print("統合: 回転源 PnP のキーフレーム "
                                   + (f"{fusion_pnp['n0']} 点" if fusion_pnp else "作れず（直近の F 良好フレームなし／特徴点不足）→ 回転は保持"))
@@ -4109,6 +4459,7 @@ while True:
                         fusion_rot_motion_until = 0.0
                         fusion_pnp = None
                         fusion_pnp_bad_since = None
+                        f_guard_after_return = True   # ⑯ 戻った直後の F（統合のずれを引き継ぐ）で見張りのキーフレームを作らない
                         if _do_search:
                             # ① 候補はこの場では評価しない（1 フレーム 450 ms 止まる）。画像を控えて次フレームから分割評価する
                             return_search_job = return_search_begin(frame_img, dist_map, poses_by_key["F"], _occl_text)
@@ -4204,6 +4555,13 @@ while True:
                                 _c_prior = None
                             fusion_pnp_info = pnp_track(fusion_pnp, _pnp_gray(frame_img), _c_prior, bgr=frame_img,
                                                         edge_ctx=(dist_map, list(sane)) if (sane and FUSION_PNP_USE_EDGES) else None)
+                            if PNP_DUMP_PATH:
+                                _a = np.where(fusion_pnp["alive"])[0]
+                                _pnp_dump_frames.append({
+                                    "t": time.time(), "seg": len(_pnp_dump_segments) - 1, "idx": _a,
+                                    "cur": fusion_pnp["cur"][_a].copy(), "R": fusion_pnp["R"].copy(), "t_vec": fusion_pnp["t"].copy(),
+                                    "ok": bool(fusion_pnp_info["ok"]), "still": bool(fusion_pnp_info.get("still", False)),
+                                    "c_prior": None if _c_prior is None else np.asarray(_c_prior, np.float64).copy()})
                             R_target = None
                             if not fusion_pnp_info["ok"]:
                                 rot_src_now = "PNP(bad)"          # 解を信用できない → 回転は今のまま
@@ -4555,7 +4913,11 @@ while True:
                 # 遮蔽は数秒で去ることが多く、その間は last_good_pose を保持した方が全探索より良い。
                 held_long_enough = (lost_start_time is not None
                                     and now - lost_start_time >= HOLD_BEFORE_RECOVERY_SEC)
-                if force_relock or (lost_streak >= QUALITY_LOSS_CONSECUTIVE and held_long_enough
+                # ⑫ 遮蔽中で PnP が解けている間は見失っていない（出力は PnP で保持）→ 品質低下での再ロックは待つ
+                pnp_holding = (FUSION_PNP_DEFER_RELOCK and fusion_off_f and fusion_pnp is not None
+                               and fusion_pnp_bad_since is None and anchor_switch_pose is not None
+                               and now - anchor_switch_time < FUSION_PNP_DEFER_MAX_SEC)
+                if force_relock or (lost_streak >= QUALITY_LOSS_CONSECUTIVE and held_long_enough and not pnp_holding
                                     and now - last_recovery_time >= RECOVERY_COOLDOWN_SEC):
                     force_relock = False
                     use_search = relock_fail_count >= RELOCK_FAILS_BEFORE_SEARCH
@@ -4623,7 +4985,19 @@ while True:
                     _vel_t[2] = 0.0   # F 追跡中は奥行きを予測しない（M3T が引き戻せず自己維持で滑る）
                 if fusion_off_f or (PREDICT_F_ENABLED and float(np.linalg.norm(_vel_t)) >= PREDICT_F_MIN_SPEED_M):
                     _start = _predict_pose_by_velocity(pose, _vel_t, pose_vel_rv)
-            reset_all_anchors(_start)
+            _f_free = False
+            if F_FREE_IN_FUSION and fusion_off_f and group_poses_raw is not None:
+                # ⑬ 統合中は F を出力へ戻さず自分で追わせる（手が離れたら F が自力で正しい姿勢へ収束し、q で復帰できるように）。
+                #   出力から大きく離れたら（遮蔽で流れた）出力へ戻す
+                _fr = group_poses_raw["F"]
+                _d_mm = float(np.linalg.norm(_group_center_cam("F", _fr) - _group_center_cam("F", _start))) * 1000.0
+                _f_free = (_d_mm <= F_FREE_MAX_MM and rotation_angle_deg(_fr, _start) <= F_FREE_MAX_DEG)
+            if _f_free:
+                for a in ANCHORS:
+                    if a["key"] != "F":
+                        a["model"].reset_pose_cv(_start)
+            else:
+                reset_all_anchors(_start)
             poses_by_key = {a["key"]: pose for a in ANCHORS}
             coast_decided = False
         else:
@@ -4837,6 +5211,20 @@ while True:
 
 _grabber.stop()
 cap.release()
+if recorder is not None and recorder.active:
+    recorder.stop()
+if recorder is not None:
+    _t_flush = time.monotonic()
+    while not recorder.q.empty() and time.monotonic() - _t_flush < 10.0:   # 書き出し待ち（録画の途中で終了したとき）
+        time.sleep(0.05)
+    time.sleep(0.3)   # 最後の項目（stop）の書き出し
+if PNP_DUMP_PATH:
+    import pickle
+    _keep = ("Ks", "X", "born", "born_poses", "born_uv", "R0", "t0")
+    with open(PNP_DUMP_PATH, "wb") as _f:
+        pickle.dump({"segments": [{k: s[k] for k in _keep} for s in _pnp_dump_segments],
+                     "frames": _pnp_dump_frames, "F_centroid": ANCHOR_BY_KEY["F"]["centroid"]}, _f)
+    print(f"PnP 診断を保存: {PNP_DUMP_PATH}（区間 {len(_pnp_dump_segments)}、フレーム {len(_pnp_dump_frames)}）")
 log_file.close()
 if unity_udp_sock is not None:
     unity_udp_sock.close()

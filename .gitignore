@@ -18,3 +18,6 @@ calibration_images*/
 
 # Per-PC settings read by Unity and the tracker (camera_io.py)
 m3t_local.env
+
+# Offline-tuning recordings (large video files)
+experiment/sessions/
