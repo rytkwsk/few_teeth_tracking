@@ -462,6 +462,17 @@ FUSION_PNP_FROM_GUARD = os.environ.get("M3T_FUSION_PNP_FROM_GUARD", "0") == "1"
 #   M3T_FUSION_DEPART_FROM_GUARD=1 で姿勢ごと（回転源 PnP も見張りの点）、=2 で回転だけ見張りから（F 重心の位置は last_good、
 #   回転源 PnP は従来どおり直近の良好フレームから。見張りのキーフレームは並進が 2〜3 mm 偏ることがあった: occ_static_01 で 86→40%）。
 FUSION_DEPART_FROM_GUARD = int(os.environ.get("M3T_FUSION_DEPART_FROM_GUARD", "0") or 0)
+# ⑱ 切り分け用（2026-10-21）: 統合中の姿勢に部分モデル（歯群）を使わず、特徴点 PnP だけで出す。歯群は切替・復帰の判断と
+#   表示にだけ使う（PnP の重心の事前分布・位置の平滑化・逸脱監視・PnP が使えないときの歯群からの姿勢を外す）。
+#   M3T_FUSION_PNP_ONLY=1 で有効。
+FUSION_PNP_ONLY = os.environ.get("M3T_FUSION_PNP_ONLY", "0") == "1"
+# ⑲ Anchor Switching の本体（2026-10-21）: 遮蔽中の特徴点 PnP を「見えているアンカー（歯群）」の上の点だけで解く。
+#   各点がどの歯群の上にあるかをキーフレームを作るときに決めておき、適合度 s が FUSION_PNP_ANCHOR_Q 未満の歯群（隠れていると
+#   判定したアンカー）の点はそのフレームの解から外す。見えている歯群の点が FUSION_PNP_ANCHOR_MIN_POINTS 未満なら全部の点で解く。
+#   使ったアンカーは Unity のパネル・歯群の色分けに出す。M3T_FUSION_PNP_ANCHORS=1 で有効、しきい値は M3T_FUSION_PNP_ANCHOR_Q。
+FUSION_PNP_ANCHORS = os.environ.get("M3T_FUSION_PNP_ANCHORS", "0") == "1"
+FUSION_PNP_ANCHOR_Q = float(os.environ.get("M3T_FUSION_PNP_ANCHOR_Q", "0.55"))
+FUSION_PNP_ANCHOR_MIN_POINTS = 30
 F_GUARD_MAX_RES_PX     = 1.0
 # ⑦ 統合から抜け出せない状態の検知（2026-10-20 19:47 run）: 遮蔽中に回して回転が 17.6° ずれたまま PnP の点が 0 になり、
 #   手を離して A/B は q 0.7 で見えているのに、F は出力（ずれた姿勢）へ毎フレーム同期されるので q 0.52〜0.55 から上がらず
@@ -581,6 +592,8 @@ USE_TEXTURE_MODALITY = os.environ.get("M3T_TEXTURE", "1") != "0"
 _model_key        = "four_group_molar_premolar_canine_incisor"
 pose_slots_dir    = os.path.join(SCRIPT_DIR, "initial_poses", _model_key)
 calibration_path  = os.path.join(PYM3T_DIR, "camera_calibration.npz")
+# 別のキャリブを使う（古い録画を当時の K で再生するときなど。2026-10-21）
+calibration_path  = os.environ.get("M3T_CALIBRATION") or calibration_path
 log_dir           = os.path.join(SCRIPT_DIR, "logs")
 
 # OBJ の 1 モデル単位 = 何メートルか（typodont と同じスケールなら 0.04）
@@ -1399,6 +1412,10 @@ if SINGLE_BODY_MODE:
             build_anchor("D", ANCHOR_D_NAME, anchor_d_path, ANCHOR_D_SPHERE_RADIUS, ANCHOR_D_SHARP_EDGE_DEG, ANCHOR_D_COLOR),
         ]
         print("階層アンカーモード: 歯列全体 F を主アンカー、4 歯群 A〜D を副アンカーとして追跡します")
+        # ⑲ 特徴点 PnP の点を歯群（アンカー）に振り分けるための表（F の頂点 → 最も近い歯群の頂点の歯群）
+        #   頂点は 3 つおきに間引く（点の間隔 < 0.5 mm なので振り分けは変わらず、1 キーフレームあたり数 ms）
+        _ANCHOR_LABEL_V = np.concatenate([a["all_vertices"][::3] for a in ANCHORS[1:]]).astype(np.float32)
+        _ANCHOR_LABEL_K = np.concatenate([np.full(len(a["all_vertices"][::3]), a["key"]) for a in ANCHORS[1:]])
     else:
         print("単体ボディモード: 4 グループ結合モデルを 1 つの M3T ボディとして追跡します")
 else:
@@ -2191,7 +2208,22 @@ def _pnp_detect(gray, R, t, max_features, extra_mask=None):
     return np.array(keep_pts, np.float32), V[keep_ids]
 
 
-def pnp_keyframe_begin(gray, pose, kf_time=None):
+_anchor_flann = None
+
+
+def _anchor_labels(X):
+    """モデル座標の点 X（F の頂点）→ それぞれが乗っている歯群（アンカー）のキー。歯群を読んでいなければ空文字。
+    最近傍は k-d 木（OpenCV FLANN）で引く。総当たりだと F の見張りがキーフレームを作るたびに約 0.2 s 止まった（2026-10-21）。"""
+    global _anchor_flann
+    if not FUSION_PNP_ANCHORS or "_ANCHOR_LABEL_V" not in globals() or len(X) == 0:
+        return np.full(len(X), "", dtype="<U1")
+    if _anchor_flann is None:
+        _anchor_flann = cv2.flann_Index(_ANCHOR_LABEL_V, {"algorithm": 1, "trees": 4})   # 1 = KDTREE
+    idx, _ = _anchor_flann.knnSearch(np.ascontiguousarray(X, np.float32), 1, params={"checks": 32})
+    return _ANCHOR_LABEL_K[idx.ravel()]
+
+
+def pnp_keyframe_begin(gray, pose, kf_time=None, with_anchors=True):
     """遮蔽直前の F 良好フレーム（縮小グレー）と姿勢から、メッシュに結び付いた特徴点の集合を作る。取れなければ None。"""
     R, t = pose[:3, :3].astype(np.float64), pose[:3, 3].astype(np.float64)
     pts, X = _pnp_detect(gray, R, t, FUSION_PNP_MAX_POINTS)
@@ -2202,7 +2234,7 @@ def pnp_keyframe_begin(gray, pose, kf_time=None):
             "R0": R.copy(), "t0": t.copy(), "R": R.copy(), "t": t.copy(), "n0": len(pts), "refreshed": 0,
             # 診断用（M3T_PNP_DUMP）: 各点を結び付けた姿勢の番号と、その姿勢・時刻の一覧
             "born": np.zeros(len(pts), np.int32), "born_poses": [(kf_time, R.copy(), t.copy())],
-            "born_uv": pts.copy()}
+            "born_uv": pts.copy(), "anchor": _anchor_labels(X) if with_anchors else np.full(len(X), "", dtype="<U1")}
 
 
 def _pnp_refresh(st, gray, tooth_mask):
@@ -2227,6 +2259,7 @@ def _pnp_refresh(st, gray, tooth_mask):
     st["born_poses"].append((time.time(), st["R"].copy(), st["t"].copy()))
     st["born"] = np.concatenate([st["born"], np.full(len(pts), len(st["born_poses"]) - 1, np.int32)])
     st["born_uv"] = np.vstack([st["born_uv"], pts])
+    st["anchor"] = np.concatenate([st["anchor"], _anchor_labels(X)])
     return len(pts)
 
 
@@ -2352,7 +2385,7 @@ def pnp_output_pose(st, R_out):
     return out
 
 
-def pnp_track(st, gray, c_prior, bgr=None, edge_ctx=None):
+def pnp_track(st, gray, c_prior, bgr=None, edge_ctx=None, anchor_ok=None):
     """キーフレーム特徴点を前フレームから LK で追い（前後追跡チェック）、姿勢を解く。bgr があれば点の補充に使う。
     edge_ctx = (向き付きエッジ距離マップ, 見えている歯群のキー) を渡すと、その歯の輪郭も一緒に使って解く（⑧）。
     戻り値 dict: ok, still（静止判定）, R, n, std_deg, res_px, deg（キーフレームからの回転）, disp_px, added, edge_q。"""
@@ -2381,6 +2414,18 @@ def pnp_track(st, gray, c_prior, bgr=None, edge_ctx=None):
     out["n"] = int(len(idx))
     if len(idx) < FUSION_PNP_MIN_POINTS:
         return out
+    # ⑲ アンカー: 隠れていると判定された歯群（適合度が低い歯群）の上の点は、このフレームの解から外す
+    #   （点は捨てない。歯群が見えるようになればまた使う）。見えている歯群の点が少なすぎるときは全部の点で解く
+    out["anchors"] = None
+    if anchor_ok is not None and FUSION_PNP_ANCHORS and "anchor" in st and len(st["anchor"]) == len(st["X"]):
+        lab = st["anchor"][idx]
+        use = np.isin(lab, list(anchor_ok))
+        if int(use.sum()) >= FUSION_PNP_ANCHOR_MIN_POINTS:
+            idx = idx[use]
+            out["anchors"] = sorted(set(lab[use].tolist()))
+            out["n"] = int(len(idx))
+        else:
+            out["anchors_fallback"] = True
     # ① 静止判定（ZUPT）: 大多数の点がキーフレームから動いていなければ、模型は動いていない
     disp = np.linalg.norm(st["cur"][idx] - st["kf_pts"][idx], axis=1)
     out["disp_px"] = float(np.median(disp))
@@ -4228,7 +4273,7 @@ while True:
                         # 見張りが使えない（点不足・残差大）まま F が良好なら取り直す
                         _rekey = _qf_g >= F_GUARD_MIN_QF and _now_g - f_guard_time >= F_GUARD_REKEY_SEC
                 if _rekey and _f_long and _qf_g >= F_GUARD_MIN_QF:
-                    f_guard = pnp_keyframe_begin(_gray_g, poses_by_key["F"])
+                    f_guard = pnp_keyframe_begin(_gray_g, poses_by_key["F"], with_anchors=False)   # 見張りは歯群の振り分け不要
                     f_guard_time = _now_g
                     f_guard_streak = 0
                     f_guard_after_return = False
@@ -4407,6 +4452,8 @@ while True:
                             #   見張りが F と一致を確かめて作ったもの。点は今のフレームまで追えている）
                             fusion_pnp = f_guard
                             print("統合: 回転源 PnP は F の見張りの点を引き継ぐ")
+                        if fusion_pnp is not None and fusion_pnp is f_guard and FUSION_PNP_ANCHORS:
+                            fusion_pnp["anchor"] = _anchor_labels(fusion_pnp["X"])   # ⑲ 見張りの点は引き継いだときに歯群へ振り分ける
                         if PNP_DUMP_PATH and fusion_pnp is not None:
                             _pnp_dump_segments.append(fusion_pnp)
                         if FUSION_ROT_FROM_GROUP and FUSION_ROT_SOURCE == "pnp":
@@ -4547,14 +4594,17 @@ while True:
                         if fusion_pnp is None:
                             rot_src_now = "PNP(none)"
                         else:
-                            if sane:
+                            if sane and not FUSION_PNP_ONLY:
                                 _c_prior = _group_center_cam("F", _fuse_groups(sane, poses_by_key, fusion_rot_ref))
                             elif prev_output_pose is not None:
                                 _c_prior = _group_center_cam("F", prev_output_pose)
                             else:
                                 _c_prior = None
+                            _anchor_ok = ({k for k in ("A", "B", "C", "D")
+                                           if quality_by_key.get(k, 0.0) >= FUSION_PNP_ANCHOR_Q} if FUSION_PNP_ANCHORS else None)
                             fusion_pnp_info = pnp_track(fusion_pnp, _pnp_gray(frame_img), _c_prior, bgr=frame_img,
-                                                        edge_ctx=(dist_map, list(sane)) if (sane and FUSION_PNP_USE_EDGES) else None)
+                                                        edge_ctx=(dist_map, list(sane)) if (sane and FUSION_PNP_USE_EDGES) else None,
+                                                        anchor_ok=_anchor_ok)
                             if PNP_DUMP_PATH:
                                 _a = np.where(fusion_pnp["alive"])[0]
                                 _pnp_dump_frames.append({
@@ -4637,7 +4687,7 @@ while True:
                                      and fusion_pnp_info is not None and fusion_pnp_info["ok"])
                     _pnp_alive = fusion_pnp is not None and fusion_pnp_info is not None and fusion_pnp_info["ok"]
                     fusion_pnp_bad_since = None if _pnp_alive else (fusion_pnp_bad_since or now_t)
-                    if sane:
+                    if sane and not FUSION_PNP_ONLY:
                         fusion_no_member_since = None
                         fused = _fuse_groups(sane, poses_by_key, fusion_rot_ref)
                         if _pnp_trans_ok:
@@ -4672,13 +4722,19 @@ while True:
                     else:
                         # 使える歯群がない: F の生の姿勢（遮蔽で流れている）ではなく直前の出力姿勢を保持する。
                         # 適合度が低いままなら従来どおり HOLD → 自動再ロックへ落ちる。
-                        if fusion_no_member_since is None:
-                            fusion_no_member_since = now_t
-                        if fusion_active:
-                            print("統合: 使える歯群なし → " + ("惰性追跡中なので F の生姿勢を通す" if coasting else "直前姿勢を保持")
-                                  + (f" (除外 {' '.join(dropped)})" if dropped else ""))
-                        fusion_active = False
-                        fusion_keys = []
+                        if sane:
+                            # ⑱ PNP_ONLY: 歯群は見えている（切替・復帰の判断と表示には使う）が、姿勢には使わない
+                            fusion_no_member_since = None
+                            fusion_active = True
+                            fusion_keys = list(sane)
+                        else:
+                            if fusion_no_member_since is None:
+                                fusion_no_member_since = now_t
+                            if fusion_active:
+                                print("統合: 使える歯群なし → " + ("惰性追跡中なので F の生姿勢を通す" if coasting else "直前姿勢を保持")
+                                      + (f" (除外 {' '.join(dropped)})" if dropped else ""))
+                            fusion_active = False
+                            fusion_keys = []
                         if _pnp_trans_ok:
                             # ④ 歯群が見えなくても特徴点 PnP が生きていれば、その姿勢で追う
                             fusion_hold_pose = pnp_output_pose(fusion_pnp, fusion_rot_ref[:3, :3])
@@ -4686,7 +4742,8 @@ while True:
                         elif coasting:
                             # ① 惰性追跡中は凍結しない: 予測姿勢から進めた F の生姿勢をそのまま出力し、保持姿勢も更新する
                             fusion_hold_pose = poses_by_key["F"].copy()
-                        elif (PREDICT_ENABLED and now_t - fusion_no_member_since <= FUSION_HOLD_PREDICT_MAX_SEC
+                        elif (PREDICT_ENABLED and fusion_no_member_since is not None
+                              and now_t - fusion_no_member_since <= FUSION_HOLD_PREDICT_MAX_SEC
                               and float(np.linalg.norm(pose_vel_t)) >= COAST_MIN_SPEED_M_PER_FRAME):
                             # 案 B: 動いている最中に歯群が全部隠れたら、保持姿勢を直前の速度で進める（速度は減衰させる）
                             fusion_hold_pose = _predict_pose_by_velocity(fusion_hold_pose, pose_vel_t, pose_vel_rv)
@@ -4696,6 +4753,9 @@ while True:
                         else:
                             poses_by_key["F"] = fusion_hold_pose.copy()
                         display_anchor = ""
+                    if (FUSION_PNP_ANCHORS and fusion_off_f and fusion_pnp_info is not None
+                            and fusion_pnp_info.get("ok") and fusion_pnp_info.get("anchors")):
+                        display_anchor = "+".join(fusion_pnp_info["anchors"])   # ⑲ 姿勢に使ったアンカーを表示する
                 active_anchor = "F"
             pose = poses_by_key[active_anchor]
             if (HIERARCHICAL_ANCHORS and GROUP_ROTATION_FROM_F and active_anchor != "F"
