@@ -10,7 +10,8 @@
   - 削り込んで先端が表面より深くなると視線の交点がずれる（斜めから見ている分）。ここで見るのは削り始めの当て位置
 
     python experiment/tip_detect.py <セッション>/<クリップ> [--tag base] [--pose ref] [--tooth 36]
-出力: <クリップ>/tip_<tag>.csv（フレームごと）と tip_<tag>.jpg（遮蔽中のフレームを並べた確認用の絵）。
+出力: <クリップ>/tip_<tag>.csv（フレームごと）、tip_<tag>.jpg（遮蔽中のフレームを並べた確認用の絵）、tip_<tag>_top.png
+（上から見た先端の分布と 1 mm の照準）。--pose track のときは tip_<tag>_track.*。mb / ml / d 区間ごとのずれも表示する。
 """
 import argparse
 import csv
@@ -23,7 +24,7 @@ import numpy as np
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UNITY = os.path.join(os.path.dirname(REPO), "unity-few-teeth-tracking")
 UNIT_M = 0.025          # OBJ 1 単位 = 25 mm（MODEL_UNIT_IN_METER）
-OCCLUDED = ("occlude", "move", "hold")
+OCCLUDED = ("occlude", "move", "hold", "mb", "ml", "d", "trace")   # mb/ml/d/trace = record.py の 9（reamer）
 
 
 def load_obj(path):
@@ -88,8 +89,20 @@ def main():
     ap.add_argument("--tooth", default="36")
     ap.add_argument("--maha", type=float, default=25.0, help="歯の色からのマハラノビス距離の 2 乗がこれを超えたら歯ではない")
     ap.add_argument("--min-area", type=int, default=40, help="器具とみなす塊の最小の画素数")
+    ap.add_argument("--detector", choices=("color", "bg"), default="color",
+                    help="color = 歯の色でない画素の、歯の長軸を下った端（59° 用。30° で横から入る器具ではシャフトが歯の輪郭を"
+                         "横切る所を先端と取り違えた）/ bg = 遮蔽前の映像との差（模型とカメラが動かない録画用）の塊で、"
+                         "器具が範囲に入ってくる所からいちばん遠い点")
+    ap.add_argument("--bg-lum", type=float, default=0.22,
+                    help="bg: 遮蔽前の映像との明るさの比の対数の絶対値がこれを超えたら器具。器具は 0.4〜0.75 暗く（光った所は明るく）、"
+                         "器具の影は ~0.1 なので、影を先端と取り違えないよう間で切る（Lab の差 20 だと影の端を先端にした、reamer_04）。"
+                         "色みの差は圧縮のブロックの揺れに埋もれて使えなかった")
+    ap.add_argument("--bg-margin", type=int, default=90, help="bg: 歯の投影をこれだけ広げた範囲で器具を探す（画素）")
     args = ap.parse_args()
 
+    out = args.tag if args.pose == "ref" else f"{args.tag}_{args.pose}"   # 出力 tip_<out>.*（姿勢・検出法ごとに分ける）
+    if args.detector != "color":
+        out += f"_{args.detector}"
     clip = args.clip if os.path.isabs(args.clip) else os.path.join(REPO, "experiment", "sessions", args.clip)
     V, F = load_obj(os.path.join(REPO, "models", f"tooth_{args.tooth}_smooth.obj"))
     target = json.load(open(os.path.join(UNITY, "Assets", "Resources", "Targets", f"{args.tooth}.json")))
@@ -111,7 +124,8 @@ def main():
     K, maps = camera(os.path.join(clip, "meta.json"), w, h)
     Vm = V * UNIT_M
     color_px, mu, icov = [], None, None
-    out_rows, sheet = [], []
+    bg_frames, bg = [], None
+    out_rows, sheet, tilts = [], [], []
     i = -1
     while True:
         ok, raw = cap.read()
@@ -123,6 +137,9 @@ def main():
         if pz is None:
             continue
         R, t = pz
+        # カメラの傾き（歯の長軸 = OBJ の +y と、切削開始点 → カメラの角度）。Unity の M3TTargetOverlay の表示と同じ
+        a_cam = (access * UNIT_M) @ R.T + t
+        tilts.append(float(np.degrees(np.arccos(np.clip(R[:, 1] @ (-a_cam / np.linalg.norm(a_cam)), -1.0, 1.0)))))
         img = cv2.remap(raw, maps[0], maps[1], cv2.INTER_LINEAR)
         Vc = Vm @ R.T + t
         uv = project(Vc, K)
@@ -135,15 +152,24 @@ def main():
         # 歯の色: 遮蔽前のフレームで集める（隠れる前の歯の画素）
         if i < occlude_at:
             color_px.append(lab[inner > 0][::7])
+            if i % 3 == 0:
+                bg_frames.append(img.sum(axis=2, dtype=np.float32))
             continue
         if mu is None:
             P = np.concatenate(color_px)
             mu, icov = P.mean(0), np.linalg.inv(np.cov(P.T) + np.eye(3) * 1e-3)
+            bg = np.median(np.stack(bg_frames[-30:]), axis=0)
 
-        diff = lab - mu
-        d2 = np.einsum("hwi,ij,hwj->hw", diff, icov, diff)
-        foreign = ((d2 > args.maha) & (inner > 0)).astype(np.uint8)
-        foreign = cv2.morphologyEx(foreign, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        if args.detector == "bg":
+            roi = cv2.dilate(mask, np.ones((2 * args.bg_margin + 1,) * 2, np.uint8))
+            d = np.abs(np.log((img.sum(axis=2, dtype=np.float32) + 3.0) / (bg + 3.0)))
+            foreign = ((d > args.bg_lum) & (roi > 0)).astype(np.uint8)
+            foreign = cv2.morphologyEx(foreign, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        else:
+            diff = lab - mu
+            d2 = np.einsum("hwi,ij,hwj->hw", diff, icov, diff)
+            foreign = ((d2 > args.maha) & (inner > 0)).astype(np.uint8)
+            foreign = cv2.morphologyEx(foreign, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         n, lab_cc, stats, _ = cv2.connectedComponentsWithStats(foreign)
 
         # 画面上の「根元側」の向き = 切削開始点から歯の長軸（OBJ の +y）を下った向き
@@ -153,7 +179,27 @@ def main():
         down /= np.linalg.norm(down) + 1e-9
 
         tip = None
-        if n > 1:
+        if n > 1 and args.detector == "bg":
+            # 歯の投影にかかる塊のうち最大のもの。器具は範囲の縁から入ってくるので、縁に接する画素（入口）から
+            # いちばん遠い、歯の上の画素を先端とする（入口が無ければ塊の中で歯の中心からいちばん遠い点の反対側）
+            on_tooth = [k for k in range(1, n) if stats[k, cv2.CC_STAT_AREA] >= args.min_area and (inner[lab_cc == k] > 0).any()]
+            if on_tooth:
+                k = max(on_tooth, key=lambda k: stats[k, cv2.CC_STAT_AREA])
+                comp = lab_cc == k
+                edge = comp & (cv2.erode(roi, np.ones((5, 5), np.uint8)) == 0)
+                ys, xs = np.nonzero(comp & (inner > 0))
+                if edge.any():
+                    ey, ex = np.nonzero(edge)
+                    entry = np.array([ex.mean(), ey.mean()])
+                else:
+                    cy, cx = np.nonzero(comp)
+                    my, mx = np.nonzero(mask)
+                    c = np.array([mx.mean(), my.mean()])
+                    far = np.argmax((cx - c[0]) ** 2 + (cy - c[1]) ** 2)
+                    entry = np.array([cx[far], cy[far]], float)
+                j = int(np.argmax((xs - entry[0]) ** 2 + (ys - entry[1]) ** 2))
+                tip = (float(xs[j]), float(ys[j]))
+        elif n > 1:
             k = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
             if stats[k, cv2.CC_STAT_AREA] >= args.min_area:
                 ys, xs = np.nonzero(lab_cc == k)
@@ -192,23 +238,92 @@ def main():
             sheet.append(cv2.resize(crop, (320, 240)))
 
     keys = sorted({k for r in out_rows for k in r}, key=lambda k: (k not in ("frame", "phase", "area"), k))
-    with open(os.path.join(clip, f"tip_{args.tag}.csv"), "w", newline="", encoding="utf-8") as f:
+    with open(os.path.join(clip, f"tip_{out}.csv"), "w", newline="", encoding="utf-8") as f:
         wr = csv.DictWriter(f, fieldnames=keys)
         wr.writeheader()
         wr.writerows(out_rows)
     if sheet:
         while len(sheet) % 4:
             sheet.append(np.zeros_like(sheet[0]))
-        cv2.imwrite(os.path.join(clip, f"tip_{args.tag}.jpg"),
+        cv2.imwrite(os.path.join(clip, f"tip_{out}.jpg"),
                     np.vstack([np.hstack(sheet[k:k + 4]) for k in range(0, len(sheet), 4)]))
 
     occ = [r for r in out_rows if r["phase"] in OCCLUDED]
     found = [r for r in occ if "x" in r]
-    print(f"{os.path.basename(clip)}: occluded frames {len(occ)}, tip on the tooth {len(found)}")
+    print(f"{os.path.basename(clip)}: occluded frames {len(occ)}, tip on the tooth {len(found)}, "
+          f"camera tilt from the tooth axis {np.median(tilts) if tilts else float('nan'):.0f} deg")
     if found:
         P = np.array([[r["x"], r["z"]] for r in found]) * 25.0
         print(f"  tip xz spread (std) {P.std(0).round(2)} mm; nearest target median: "
               + ", ".join(f"{n} {np.median([r[f'd_{n}_mm'] for r in found]):.1f} mm" for n in entries))
+    summarize_phases(out_rows, entries, target, clip, out)
+
+
+def summarize_phases(out_rows, entries, target, clip, tag):
+    """record.py の 9（reamer）の mb / ml / d 区間ごとに、狙った照準からのずれを近遠心（+M）・頬舌（+B）に分けて出す。
+    正解は「術者が当てた黄色い円」= AR 画面に描いた照準なので、--pose track（表示と同じ姿勢）で比べるのが目的に合う。
+    上から見た図（tip_<tag>_top.png）も描く。"""
+    mesial = np.array(target["mesial"])[[0, 2]]
+    buccal = np.array(target["buccal"])[[0, 2]]
+    aimed = {"mb": "MB", "ml": "ML", "d": "D"}
+    lines = []
+    for ph, name in aimed.items():
+        rows = [r for r in out_rows if r["phase"] == ph]
+        if name not in entries or not rows:
+            continue
+        hits = [r for r in rows if "x" in r]
+        if not hits:
+            lines.append(f"  {ph:3s} -> {name:2s}: frames {len(rows)}, tip found 0")
+            continue
+        off = (np.array([[r["x"], r["z"]] for r in hits]) - entries[name][[0, 2]]) * 25.0
+        m, b = off @ mesial, off @ buccal
+        d = np.hypot(m, b)
+        nearest = [min(entries, key=lambda n: r[f"d_{n}_mm"]) for r in hits]
+        right = sum(n == name for n in nearest) / len(hits)
+        lines.append(f"  {ph:3s} -> {name:2s}: frames {len(rows)}, tip found {len(hits)} ({len(hits) / len(rows):.0%}), "
+                     f"error median {np.median(d):.1f} / p90 {np.percentile(d, 90):.1f} mm, "
+                     f"offset median M {np.median(m):+.1f} B {np.median(b):+.1f} mm, "
+                     f"spread (std) M {m.std():.1f} B {b.std():.1f} mm, nearest = {name} {right:.0%}")
+    if lines:
+        print("  per aimed orifice (+M = mesial, +B = buccal):")
+        print("\n".join(lines))
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    # 上から見た図: 横 = 近遠心（右が M）、縦 = 頬舌（上が B）。原点 = 切削開始点
+    origin = np.array(target["access"])[[0, 2]]
+
+    def to_mb(p):
+        q = (np.atleast_2d(p) - origin) * 25.0
+        return q @ mesial, q @ buccal
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    if target.get("outline"):
+        o = np.array(target["outline"]).reshape(-1, 3)[:, [0, 2]]
+        x, y = to_mb(np.vstack([o, o[:1]]))
+        ax.plot(x, y, color="0.6", lw=1)
+    colors = {"trace": "0.75", "mb": "tab:red", "ml": "tab:blue", "d": "tab:green"}
+    for ph, c in colors.items():
+        pts = np.array([[r["x"], r["z"]] for r in out_rows if r["phase"] == ph and "x" in r])
+        if len(pts):
+            x, y = to_mb(pts)
+            ax.scatter(x, y, s=6, color=c, alpha=0.5, label=f"{ph} ({len(pts)})")
+    for name, e in entries.items():
+        x, y = to_mb(e[[0, 2]])
+        ax.add_patch(plt.Circle((x[0], y[0]), 1.0, fill=False, color="k", lw=1.5, zorder=3))
+        ax.text(x[0] + 1.1, y[0] + 1.1, name, fontsize=12, weight="bold", zorder=3)
+    ax.set_aspect("equal")
+    ax.set_xlabel("mesial (+) / distal (-)  [mm]")
+    ax.set_ylabel("buccal (+) / lingual (-)  [mm]")
+    ax.set_title(f"{os.path.basename(clip)}: detected tip, circles = 1 mm targets", fontsize=10)
+    ax.grid(alpha=0.3)
+    ax.legend(loc="lower left", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(clip, f"tip_{tag}_top.png"), dpi=110)
+    plt.close(fig)
 
 
 if __name__ == "__main__":
