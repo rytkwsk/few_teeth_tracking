@@ -207,6 +207,25 @@ anchor_b_path = _model_path(ANCHOR_B_NAME)
 anchor_c_path = _model_path(ANCHOR_C_NAME)
 anchor_d_path = _model_path(ANCHOR_D_NAME)
 
+
+# 歯群・歯列全体のモデルの差し替え（根管治療ガイド, 2026-11-06）。M3T_MODEL_A〜D / M3T_MODEL_F に models/ の
+# ファイル名（または絶対パス）を渡すとそのモデルを使う。治療する歯は上から削られて隠れ・形も変わるので追跡に使わず、
+# 両隣の歯で追う構成にするため（例: 36 を治療するとき A = 37 だけ、F = 36 を除いた歯列。Unity の
+# Tools/split_target_tooth.py が作り、RootCanalNeighborScene が渡す）。座標系は元のモデルと同じであること。
+def _model_override(env_key):
+    value = os.environ.get(env_key, "").strip()
+    if not value:
+        return None
+    return value if os.path.isabs(value) else os.path.join(SCRIPT_DIR, "models", value)
+
+
+for _key in "ABCD":
+    _override = _model_override(f"M3T_MODEL_{_key}")
+    if _override:
+        globals()[f"ANCHOR_{_key}_NAME"] = os.path.basename(_override)
+        globals()[f"anchor_{_key.lower()}_path"] = _override
+        print(f"モデル差し替え: 歯群 {_key} = {_override}")
+
 # ── 単体ボディモード ─────────────────────────────────────────────────────────
 # pym3t ラッパーはモデルごとに独立した Link/Optimizer を作るため、4 グループを別モデルにすると
 # 4 つの 6DoF 最適化が独立に走り、Python 側で「良い方の pose に全員を同期」するしかなかった
@@ -607,6 +626,10 @@ POSE_JUMP_STUCK_FRAMES    = 12
 # スコアで比較し、かつ 3 フレーム連続で同じ跳び先に収束したときだけ受け入れる。
 ARCH_ANCHOR_KEY = "F" if SINGLE_BODY_MODE else "A"
 arch_model_path = os.path.join(SCRIPT_DIR, "models", ARCH_MODEL_NAME)
+if _model_override("M3T_MODEL_F"):
+    arch_model_path = _model_override("M3T_MODEL_F")
+    ARCH_MODEL_NAME = os.path.basename(arch_model_path)
+    print(f"モデル差し替え: 歯列全体 F = {arch_model_path}")
 
 # M3T の texture modality（実画像の特徴点で相対運動を拘束。モデルにテクスチャは不要）。
 # 奥行き方向の暴走に効く可能性があるが未検証。
